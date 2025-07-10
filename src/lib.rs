@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{from_str, Value};
+use serde_json::{from_str, json, Value};
 use thiserror::Error;
 // protocol version
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -96,7 +96,126 @@ pub enum McpError{
     ProtocolError(String),
     #[error("Authentication error: {0}")]
     AuthError(String),
+    #[error("Unsupported protocol version: requested {requested}, supported versions: {supported:?}")]
+    UnsupportedProtocolVersion {
+        requested: String,
+        supported: Vec<String>
+    },
+    #[error("Request timed out")]
+    RequestTimeout,
+    #[error("Oneshot channel send error: {0}")]
+    OneshotSend(String),
+    #[error("Oneshot channel receive error: {0}")]
+    OneshotRecv(#[from] tokio::sync::oneshot::error::RecvError),
 }
+
+//--------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>, // Added 'title'
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>, // Added 'title'
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roots: Option<ClientRootsCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<Value>, // Empty object {} -> use Value for now
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation: Option<Value>, // Empty object {} -> use Value for now
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<Value>, // Empty object {} -> use Value for now
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientRootsCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<Value>, // Empty object {} -> use Value for now
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<ServerPromptsCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ServerResourcesCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ServerToolsCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completions: Option<Value>, // Empty object {} -> use Value for now
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<Value>, // Empty object {} -> use Value for now
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerResourcesCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerToolsCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerPromptsCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+// --- Initialize Request/Response Payloads ---
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeRequestParams {
+    pub protocol_version: String, // MANDATORY
+    pub capabilities: ClientCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_info: Option<ClientInfo>, // Now optional, but typically present
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeResult {
+    pub protocol_version: String, // MANDATORY
+    pub capabilities: ServerCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_info: Option<ServerInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+
+// --- New constructors for initialize and initialized ---
+
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -117,6 +236,18 @@ impl Request {
              params: params.into()   
             }
     }
+
+    pub fn new_initialize(id: RequestId, protocol_version:String, capabilities: ClientCapabilities, client_info:Option<ClientInfo>) -> Self {
+        let params = InitializeRequestParams {
+            protocol_version,
+            capabilities,
+            client_info: client_info,
+        };
+
+        Request::new(id, "initialize", params)
+
+    }
+
     pub fn to_json(&self) -> Result<String, McpError> {
         serde_json::to_string(self).map_err(
             |e| McpError::Serialization(e)
@@ -152,6 +283,29 @@ impl Response {
             }),
         }
     }
+    /// Creates a successful `initialize` response.
+    pub fn new_initialize_success(id: RequestId, result: InitializeResult) -> Self {
+        Response::new_success(
+            id,
+            Some(serde_json::to_value(result).expect("Failed to serialize InitializeResult"))
+        )
+    }
+
+    pub fn new_unsupported_protocol_error(
+        id: RequestId,
+        requested_version: String,
+        supported_versions: Vec<String>,
+    ) -> Self {
+        Response::new_error(
+            id,
+            -32602, // Standard JSON-RPC InvalidParams error code, common for protocol issues
+            "Unsupported protocol version",
+            Some(json!({
+                "supported": supported_versions,
+                "requested": requested_version
+            })),
+        )
+    }
 
     pub fn to_json(&self) -> Result<String, McpError> {
         serde_json::to_string(self).map_err(
@@ -175,6 +329,13 @@ impl Notification {
         }
     }
 
+    pub fn new_initialized() -> Self {
+        Notification::new(
+            "notifications/initialized",
+            None // No params for this notification
+        )
+    }
+
     pub fn to_json(&self) -> Result<String, McpError> {
         serde_json::to_string(self).map_err(
             |e| McpError::Serialization(e)
@@ -185,6 +346,18 @@ impl Notification {
         serde_json::from_str(json_str).map_err(
             |e| McpError::Serialization(e)
         )
+    }
+}
+
+impl From<InitializeRequestParams> for Option<Value> {
+    fn from(params: InitializeRequestParams) -> Self {
+        Some(serde_json::to_value(params).unwrap())
+    }
+}
+
+impl From<InitializeResult> for Option<Value> {
+    fn from(result: InitializeResult) -> Self {
+        Some(serde_json::to_value(result).unwrap())
     }
 }
 
