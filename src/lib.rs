@@ -1,8 +1,12 @@
+pub mod transport;
+pub mod server;
+pub mod client;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, json, Value};
 use thiserror::Error;
 // protocol version
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq,)]
 pub struct JsonRpcBase {
     pub jsonrpc:String
 }
@@ -67,7 +71,7 @@ pub struct Notification {
     pub params: Option<Value>
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Hash, Eq)]
 #[serde(untagged)]
 pub enum RequestId {
     String(String),
@@ -107,6 +111,7 @@ pub enum McpError{
     OneshotSend(String),
     #[error("Oneshot channel receive error: {0}")]
     OneshotRecv(#[from] tokio::sync::oneshot::error::RecvError),
+    
 }
 
 //--------------------------------------------------------------------------------------
