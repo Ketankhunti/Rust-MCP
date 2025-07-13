@@ -87,7 +87,7 @@ impl McpClient {
             McpMessage::Response(response) => {
                 let id = response.id.clone();
                 let mut pending_requests = self.pending_requests.lock().unwrap();
-                if let Some(pending_req) = pending_requests.remove(&id) {
+                if let Some(pending_req) = pending_requests.remove(&id.as_ref().unwrap()) {
                     pending_req.sender.send(Ok(response))
                         .map_err(|_| McpError::OneshotSend(
                             format!("Failed to send response back for ID: {:?}. Receiver was dropped.", id)
@@ -100,7 +100,7 @@ impl McpClient {
                 eprintln!("Client received unhandled request: {:?}", request);
                 if let RequestId::Number(id) = request.id {
                     let error_response = Response::new_error(
-                        id,
+                        Some(id.into()),
                         -32601,
                         &format!("Method '{}' not supported by client", request.method),
                         None

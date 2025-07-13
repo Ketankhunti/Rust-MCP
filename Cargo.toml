@@ -10,3 +10,16 @@ tokio = {version="1.46.0",features = ["full"]}
 thiserror = "2.0.12"
 anyhow = "1.0"
 futures = "0.3.31"
+
+[[bin]]
+name = "simple_server"
+path = "examples/simple_server.rs"
+
+[[bin]]
+name = "simple_client"
+path = "examples/simple_client.rs"
+
+# Define your integration test suite
+[[test]]
+name = "integration_tests" # Name of your test suite
+path = "tests/integration_test.rs" # Path to your test file

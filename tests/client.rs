@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn test_unsupported_protocol_error_serialization() {
         let error_resp = Response::new_unsupported_protocol_error(
-            "my_req_id".into(),
+            Some("my_req_id".into()),
             "1.0.0".to_string(),
             vec!["2025-06-18".to_string(), "2024-11-05".to_string()],
         );

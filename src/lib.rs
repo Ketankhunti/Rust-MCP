@@ -21,45 +21,21 @@ pub struct Request {
     pub params: Option<Value>
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct RawRequest {
-    #[serde(flatten)]
-    pub protocol: JsonRpcBase,
-    pub id: Option<RequestId>, // Allows missing or null ID for initial parsing
-    pub method: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Response {
     #[serde(flatten)]
     pub protocol: JsonRpcBase,
-    pub id: RequestId,
+    pub id: Option<RequestId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ResponseError>
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct RawResponse {
-    #[serde(flatten)]
-    pub protocol: JsonRpcBase,
-    pub id: Option<RequestId>, // Allows missing or null ID for initial parsing
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<ResponseError>,
-}
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)] 
-enum RawMcpMessage {
-    Request(RawRequest),
-    Response(RawResponse),
-    Notification(Notification), // Notification ID is already correctly handled as absence
-}
+
+
 
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,6 +66,8 @@ pub struct ResponseError {
 pub enum McpError{
     #[error("Json serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("Failed to parse JSON message: {0}")]
+    ParseJson(String),
     #[error("Invalid JSON-RPC 2.0 message: {0}")]
     InvalidMessage(String),
     #[error("Received unexpected message type: {0}")]
@@ -270,16 +248,16 @@ impl Response {
     pub fn new_success<I: Into<RequestId>, R: Into<Option<Value>>>(id: I, result: R) -> Self {
         Response {
             protocol: JsonRpcBase { jsonrpc: "2.0".to_string() },
-            id: id.into(),
+            id: Some(id.into()),
             result: result.into(),
             error: None,
         }
     }
 
-    pub fn new_error<I: Into<RequestId>>(id: I, code: i32, message: &str, data: Option<Value>) -> Self {
+    pub fn new_error(id: Option<RequestId>, code: i32, message: &str, data: Option<Value>) -> Self {
         Response {
             protocol: JsonRpcBase { jsonrpc: "2.0".to_string() },
-            id: id.into(),
+            id,
             result: None,
             error: Some(ResponseError {
                 code,
@@ -297,7 +275,7 @@ impl Response {
     }
 
     pub fn new_unsupported_protocol_error(
-        id: RequestId,
+        id: Option<RequestId>,
         requested_version: String,
         supported_versions: Vec<String>,
     ) -> Self {
@@ -384,74 +362,78 @@ impl From<u64> for RequestId {
     }
 }
 
+// impl From<Option<RequestId>> for RequestId {
+//     fn from(id: Option<RequestId>) -> Self {
+//         match id {
+//             Some(id) => id,
+//             None => RequestId::Number(0)
+//         }
+//     }
+// }
 impl McpMessage {
-    pub fn from_json(json: &str) -> Result<Self, McpError> {
+    pub fn from_json(json_str: &str) -> Result<Self, McpError> {
+        eprintln!("McpMessage::from_json: Attempting to parse: '{}'", json_str.trim());
 
-        // check if json contains jsonrpc protocol version
-        let raw_msg:RawMcpMessage = from_str(json)
-            .map_err(McpError::Serialization)?;
+        let raw_value: Value = serde_json::from_str(json_str)
+            .map_err(|e| {
+                eprintln!("McpMessage::from_json: Serialization error (invalid JSON string) for '{}': {}", json_str.trim(), e);
+                McpError::Serialization(e) // This is still correct for the initial `from_str`
+            })?;
 
-        match raw_msg {
-            RawMcpMessage::Request(raw_req) => {
-                if raw_req.protocol.jsonrpc != "2.0" {
-                    return Err(McpError::InvalidMessage(
-                        "Request: 'jsonrpc' must be '2.0'".to_string(),
-                    ));
+        // ... (jsonrpc_version check) ...
+
+        let id_field_present = raw_value.get("id").is_some();
+        let method_field_present = raw_value.get("method").is_some();
+        let result_field_present = raw_value.get("result").is_some();
+        let error_field_present = raw_value.get("error").is_some();
+
+        if id_field_present {
+            if method_field_present {
+                let request: Request = serde_json::from_value(raw_value.clone())
+                    .map_err(|e| {
+                        eprintln!("McpMessage::from_json: Failed to deserialize as Request, but looked like one: {}", e);
+                        // Use the new ParseJson variant here
+                        McpError::ParseJson(format!("Failed to deserialize as Request: {}", e))
+                    })?;
+                eprintln!("McpMessage::from_json: Successfully parsed as Request.");
+                Ok(McpMessage::Request(request))
+            } else if result_field_present || error_field_present {
+                let response: Response = serde_json::from_value(raw_value)
+                    .map_err(|e| {
+                        eprintln!("McpMessage::from_json: Failed to deserialize as Response, but looked like one: {}", e);
+                        // Use the new ParseJson variant here
+                        McpError::ParseJson(format!("Failed to deserialize as Response: {}", e))
+                    })?;
+
+                if response.result.is_some() && response.error.is_some() {
+                    return Err(McpError::InvalidMessage("Response: 'result' and 'error' cannot both be set".to_string()));
+                }
+                if response.result.is_none() && response.error.is_none() {
+                    return Err(McpError::InvalidMessage("Response: Either 'result' or 'error' must be set".to_string()));
                 }
 
-                let id = raw_req.id.ok_or_else(|| {
-                    McpError::InvalidMessage("Request: 'id' field is required and must not be null".to_string())
-                })?;
-               
-                Ok(McpMessage::Request(Request {
-                    protocol: raw_req.protocol,
-                    id,
-                    method: raw_req.method,
-                    params: raw_req.params,
-                }))
-            },
-            RawMcpMessage::Response(raw_res) => {
-                if raw_res.protocol.jsonrpc != "2.0" {
-                    return Err(McpError::InvalidMessage(
-                        "Response: 'jsonrpc' must be '2.0'".to_string(),
-                    ));
-                }
-                // Response ID must be present (unless it's an error response for unknown ID, which is handled implicitly by `ResponseError`'s `id: Option<RequestId>` if we had it, but for now we expect it)
-                let id = raw_res.id.ok_or_else(|| {
-                    McpError::InvalidMessage("Response: 'id' field is required and must not be null".to_string())
-                })?;
-
-                // Either result OR error MUST be set, not both.
-                if raw_res.result.is_some() && raw_res.error.is_some() {
-                    return Err(McpError::InvalidMessage(
-                        "Response: 'result' and 'error' cannot both be set".to_string(),
-                    ));
-                }
-                if raw_res.result.is_none() && raw_res.error.is_none() {
-                    return Err(McpError::InvalidMessage(
-                        "Response: Either 'result' or 'error' must be set".to_string(),
-                    ));
-                }
-
-                Ok(McpMessage::Response(Response {
-                    protocol: raw_res.protocol,
-                    id,
-                    result: raw_res.result,
-                    error: raw_res.error,
-                }))
+                eprintln!("McpMessage::from_json: Successfully parsed as Response.");
+                Ok(McpMessage::Response(response))
+            } else {
+                Err(McpError::InvalidMessage(format!("Message has 'id' but is neither a Request nor a Response (missing 'method' or 'result'/'error'): {}", json_str.trim())))
             }
-            RawMcpMessage::Notification(notif) => {
-                if notif.base.jsonrpc != "2.0" {
-                    return Err(McpError::InvalidMessage(
-                        "Notification: 'jsonrpc' must be '2.0'".to_string(),
-                    ));
-                }
-                Ok(McpMessage::Notification(notif))
+        } else {
+            if method_field_present {
+                let notification: Notification = serde_json::from_value(raw_value)
+                    .map_err(|e| {
+                        eprintln!("McpMessage::from_json: Failed to deserialize as Notification, but looked like one: {}", e);
+                        // Use the new ParseJson variant here
+                        McpError::ParseJson(format!("Failed to deserialize as Notification: {}", e))
+                    })?;
+                eprintln!("McpMessage::from_json: Successfully parsed as Notification.");
+                Ok(McpMessage::Notification(notification))
+            } else {
+                Err(McpError::InvalidMessage(format!("Message is neither a Request, Response, nor Notification (missing 'id' and 'method'): {}", json_str.trim())))
             }
         }
     }
-
-    pub fn to_json(&self) -> Result<String, McpError> {
+    
+     pub fn to_json(&self) -> Result<String, McpError> {
         serde_json::to_string(self).map_err( |e|McpError::Serialization(e))
     }
 }

@@ -161,7 +161,7 @@ mod tests {
         let response = McpServer::handle_initialize(request, server_internal.clone()).await.unwrap();
 
         // Assert response structure and content
-        assert_eq!(response.id, request_id);
+        assert_eq!(response.id.unwrap(), request_id);
         assert!(response.result.is_some());
         assert!(response.error.is_none());
 
@@ -195,7 +195,7 @@ mod tests {
 
         let response = McpServer::handle_initialize(request, server_internal.clone()).await.unwrap();
 
-        assert_eq!(response.id, request_id);
+        assert_eq!(response.id.unwrap(), request_id);
         assert!(response.result.is_some());
         let result: InitializeResult = serde_json::from_value(response.result.unwrap()).unwrap();
         // Server should respond with its own version

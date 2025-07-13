@@ -74,7 +74,7 @@ impl McpServer {
             })
         ).await;
 
-        server
+         server
 
     }
 
@@ -92,60 +92,66 @@ impl McpServer {
         }
     }
     
-    pub async fn run(&self) -> Result<(), McpError> {
-        let mut transport = self.internal.transport.lock().await;
+     pub async fn run(&self) -> Result<(), McpError> {
+        eprintln!("Server: run loop started."); // ADD THIS
         loop {
-            tokio::select! {
-                msg_result = async {
-                    let mut transport = self.internal.transport.lock().await;
-                    transport.recv().await
-                } => {
-                    match msg_result {
-                        Ok(message) => {
-                            self.handle_message(message).await?;
-                        },
-                        Err(McpError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionAborted => {
-                            eprintln!("Server: Transport connection aborted, server exiting.");
-                            break;
-                        },
-                        Err(e) => {
-                            eprintln!("Server: Error receiving message: {:?}", e);
-                            break;
-                        }
-                    }
+            let msg_result = {
+                let mut transport_guard = self.internal.transport.lock().await;
+                eprintln!("Server: run loop acquiring transport lock for recv, waiting for message..."); // ADD THIS
+                let res = transport_guard.recv().await;
+                eprintln!("Server: run loop released transport lock for recv. Result: {:?}", res); // ADD THIS (Improved logging for Ok)
+                res
+            };
+
+            match msg_result {
+                Ok(message) => {
+                    eprintln!("Server: run loop received message, handling..."); // ADD THIS
+                    self.handle_message(message).await?;
+                    eprintln!("Server: run loop finished handling message."); // ADD THIS
+                },
+                Err(McpError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionAborted => {
+                    eprintln!("Server: Transport connection aborted (EOF), server exiting gracefully."); // CLARIFIED MESSAGE
+                    break;
+                },
+                Err(e) => {
+                    eprintln!("Server: Error receiving message: {:?}", e);
+                    eprintln!("Server: run loop encountered critical error, breaking."); // ADD THIS
+                    break;
                 }
             }
         }
+        eprintln!("Server: run loop finished."); // ADD THIS
         Ok(())
     }
-async fn handle_message(&self, message: McpMessage) -> Result<(), McpError> {
+
+
+    async fn handle_message(&self, message: McpMessage) -> Result<(), McpError> {
         match message {
             McpMessage::Request(request) => {
+                // ... (existing Request handling logic - no changes here) ...
                 let method = request.method.clone();
                 let id = request.id.clone();
-                let handlers = self.internal.request_handlers.lock().await; // Lock to access handlers
+                let handlers = self.internal.request_handlers.lock().await;
 
                 if let Some(handler) = handlers.get(&method) {
-                    // Pass a clone of the internal Arc to the handler
                     let response_result = handler(request, self.internal.clone()).await;
                     let response = match response_result {
                         Ok(res) => res,
                         Err(err) => {
                             eprintln!("Server: Handler for '{}' returned an error: {:?}", method, err);
                             Response::new_error(
-                                id,
-                                -32000, // Generic internal error code for handler failures
+                                Some(id), // ID is present for requests
+                                -32000,
                                 &format!("Internal server error: {}", err),
-                                None, // Or include more structured error data
+                                None,
                             )
                         }
                     };
                     self.internal.transport.lock().await.send(McpMessage::Response(response)).await?;
                 } else {
-                    // If no handler is registered for the method, send a Method Not Found error
                     eprintln!("Server: Received unhandled request method: {}", method);
                     let error_response = Response::new_error(
-                        id,
+                        Some(id), // ID is present for requests
                         -32601, // JSON-RPC standard "Method not found" error code
                         &format!("Method '{}' not found", method),
                         None,
@@ -155,22 +161,39 @@ async fn handle_message(&self, message: McpMessage) -> Result<(), McpError> {
             }
             McpMessage::Notification(notification) => {
                 let method = notification.method.clone();
-                let handlers = self.internal.notification_handlers.lock().await;
+                let notification_handlers = self.internal.notification_handlers.lock().await;
 
-                if let Some(handler) = handlers.get(&method) {
-                    // Pass a clone of the internal Arc to the handler
+                if let Some(handler) = notification_handlers.get(&method) {
+                    // This is a known notification, execute its handler
                     if let Err(e) = handler(notification, self.internal.clone()).await {
                         eprintln!("Server: Handler for notification '{}' returned an error: {:?}", method, e);
                     }
                 } else {
-                    eprintln!("Server: Received unhandled notification method: {}", method);
-                    // Notifications do not require a response, even if unhandled.
+                    // This is an UNHANDLED notification.
+                    // Now, check if a REQUEST handler exists for this method name.
+                    let request_handlers = self.internal.request_handlers.lock().await; // Acquire lock for request_handlers
+
+                    if request_handlers.contains_key(&method) {
+                        // This method is known as a REQUEST, but it was received as a NOTIFICATION (missing ID).
+                        // According to MCP's strict "Request MUST have ID", this is an Invalid Request from a practical standpoint.
+                        eprintln!("Server: Received method '{}' as a Notification, but it's configured as a Request handler. Informing client.", method);
+
+                        // Send an "Invalid Request" error response with id: null
+                        let error_response = Response::new_error(
+                            None, // id: null, as per JSON-RPC spec for errors when original ID is missing/unidentifiable
+                            -32600, // JSON-RPC standard "Invalid Request" error code
+                            &format!("Method '{}' expects an ID and a response, but was received as a Notification (missing 'id' field).", method),
+                            None,
+                        );
+                        self.internal.transport.lock().await.send(McpMessage::Response(error_response)).await?;
+                    } else {
+                        // Method is not known at all, neither as a request nor a notification
+                        eprintln!("Server: Received completely unknown notification method: {}", method);
+                    }
                 }
             }
             McpMessage::Response(response) => {
-                // Servers generally do not expect to receive responses from clients
-                // unless the server itself initiated a request to the client (e.g., elicitation).
-                // For this basic server, just log unexpected responses.
+                // ... (existing Response handling logic - no changes here) ...
                 eprintln!("Server: Received unexpected response from client: {:?}", response);
             }
         }
@@ -224,7 +247,7 @@ async fn handle_message(&self, message: McpMessage) -> Result<(), McpError> {
         // if negotiated_version_guard.is_some() {
         //    eprintln!("Server: Client confirmed initialization on version: {:?}", negotiated_version_guard.as_ref().unwrap());
         // }
-
+     
         Ok(())
     }
 
