@@ -2,6 +2,8 @@ pub mod transport;
 pub mod server;
 pub mod client;
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, json, Value};
 use thiserror::Error;
@@ -210,6 +212,138 @@ pub enum McpMessage {
     /// A JSON-RPC Notification. Must have a `method` but NO `id`.
     Notification(Notification),
 }
+
+
+// ---------------------   Tool Call-related Strucutres ---------------
+
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InputSchema {
+    #[serde(rename = "$ref")] 
+    Reference(String), // Reference to a schema definition
+    Inline(Value), // Inline schema definition
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>, 
+    pub description: String,
+    pub input_schema: InputSchema, // JSON Schema defining expected parameters
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<InputSchema>, // Optional JSON Schema defining expected output structure
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_auth: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>, 
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsListRequestParams {
+    pub cursor: Option<String>, // Optional cursor for pagination
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsListResult {
+    pub tools: Vec<Tool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>, // cursor for the next page of results
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsCallRequestParams {
+    #[serde(rename = "name")] // Renamed from tool_name
+    pub tool_name: String,
+    #[serde(rename = "arguments")] // Renamed from tool_parameters
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_parameters: Option<Value>,
+}
+
+/// Represents a single content block within a tool's output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(tag = "type")] // Use internal tagging for content blocks
+pub enum ToolOutputContentBlock {
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+    },
+    #[serde(rename = "image")]
+    Image {
+        data: String, // Base64-encoded image data
+        mime_type: String,
+        #[serde(flatten)] // Allows for arbitrary other fields in the block
+        extra_fields: HashMap<String, Value>, // For other image specific fields
+    },
+    #[serde(rename = "audio")]
+    Audio {
+        data: String, // Base64-encoded audio data
+        mime_type: String,
+        #[serde(flatten)] // Allows for arbitrary other fields in the block
+        extra_fields: HashMap<String, Value>, // For other audio specific fields
+    },
+    #[serde(rename = "resource_link")]
+    ResourceLink {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(flatten)] // Allows for arbitrary other fields in the block
+        extra_fields: HashMap<String, Value>, // For other link specific fields
+    },
+    #[serde(rename = "resource")]
+    EmbeddedResource {
+        resource: Resource, // Assuming a Resource struct exists or will be defined
+        #[serde(flatten)] // Allows for arbitrary other fields in the block
+        extra_fields: HashMap<String, Value>,
+    },
+    // Allows for future/custom content types not explicitly defined
+    #[serde(other)]
+    Other // Fallback for unknown "type" strings
+}
+
+
+// Assuming a basic Resource struct for `Embedded Resource` type.
+// You might need to expand this when implementing the full Resource feature.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Resource {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>, // For text-based embedded resources
+    // ... other fields for a full resource ...
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsCallResult {
+    pub content: Vec<ToolOutputContentBlock>, // The output content blocks (unstructured)
+    pub is_error: bool, // Indicates if the tool execution resulted in an error
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>, // Optional error message if is_error is true
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>, // NEW: For structured output
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>, // NEW: Optional metadata field
+}
+
+
 
 impl Request {
     pub fn new <I : Into<RequestId>, P:Into<Option<Value>>>(id: I, method: &str, params:P) -> Self {

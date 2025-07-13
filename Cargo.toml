@@ -12,14 +12,20 @@ anyhow = "1.0"
 futures = "0.3.31"
 
 [[bin]]
-name = "simple_server"
-path = "examples/simple_server.rs"
+name = "initialization_server"
+path = "examples/initialization_server.rs"
 
 [[bin]]
-name = "simple_client"
-path = "examples/simple_client.rs"
+name = "tools_server"
+path = "examples/tools_server.rs"
+
 
 # Define your integration test suite
 [[test]]
-name = "integration_tests" # Name of your test suite
-path = "tests/integration_test.rs" # Path to your test file
+name = "nitialization_tests" # Name of your test suite
+path = "tests/initialization_test.rs" # Path to your test file
+
+# Define your integration test suite
+[[test]]
+name = "tools_tests" # Name of your test suite
+path = "tests/tools_test.rs" # Path to your test file

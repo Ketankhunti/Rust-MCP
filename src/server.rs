@@ -1,9 +1,10 @@
 use std::{collections::HashMap, sync::{Arc}};
 
 use futures::future::BoxFuture;
+use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::{transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, Response, ServerCapabilities, ServerInfo};
+use crate::{transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult};
 
 type RequestHandler = Arc<
     dyn Fn(Request, Arc<McpServerInternal>) -> BoxFuture<'static, Result<Response, McpError>>
@@ -17,6 +18,12 @@ type NotificationHandler = Arc<
     + Sync,
 >;
 
+type ToolExecutionHandler = Arc<
+    dyn Fn(Value, Arc<McpServerInternal>) -> BoxFuture<'static, Result<Value, McpError>>
+    + Send
+    + Sync
+>; 
+
 pub struct McpServerInternal {
     pub transport: Mutex<StdioTransport>,
     pub request_handlers: Mutex<HashMap<String, RequestHandler>>,
@@ -26,6 +33,8 @@ pub struct McpServerInternal {
     pub server_capabilities: ServerCapabilities,
     pub server_info: ServerInfo,
     pub instructions: Option<String>,
+    pub tools: Mutex<Vec<Tool>>,
+    pub tool_execution_handlers: Mutex<HashMap<String, ToolExecutionHandler>>,
 }
 
 #[derive(Clone)]
@@ -38,7 +47,7 @@ impl McpServer {
     pub async fn new(
         server_name: String,
         server_version: Option<String>,
-        server_capabilities: ServerCapabilities,
+        mut server_capabilities: ServerCapabilities,
         instructions: Option<String>,
     ) -> Self {
         let server_info = ServerInfo {
@@ -46,6 +55,12 @@ impl McpServer {
             title: None, // Can be set later or via constructor arg
             version: server_version,
         };
+
+        // Ensure tools capability is advertised if not already present
+        if server_capabilities.tools.is_none() {
+             server_capabilities.tools = Some(crate::ServerToolsCapability { list_changed: Some(true) });
+        }
+
         let internal = Arc::new(McpServerInternal {
             transport: Mutex::new(StdioTransport::new()),
             request_handlers: Mutex::new(HashMap::new()),
@@ -55,6 +70,8 @@ impl McpServer {
             server_capabilities,
             server_info: server_info,
             instructions,
+            tools: Mutex::new(Vec::new()), // Initialize with an empty vector
+            tool_execution_handlers: Mutex::new(HashMap::new()), // Initialize with an empty map
         });
        let server = Self { internal };
 
@@ -74,7 +91,33 @@ impl McpServer {
             })
         ).await;
 
-         server
+        // Refister tools/list
+        let  internal_for_tools_list = server.internal.clone();
+
+        server.register_request_handler(
+            "tools/list",
+            Arc::new(move |request, _| {
+            let internal = internal_for_tools_list.clone();
+            Box::pin(async move {
+                McpServer::handle_tools_list(request, internal).await
+            })
+        })
+        )
+        .await;
+
+        // Register the `tools/call` request handler
+        let internal_for_tools_call = server.internal.clone();
+        server.register_request_handler(
+            "tools/call",
+            Arc::new(move |request, _| {
+                let internal = internal_for_tools_call.clone();
+                Box::pin(async move {
+                    McpServer::handle_tools_call(request, internal).await
+                })
+            })
+        ).await;
+
+        server
 
     }
 
@@ -90,6 +133,21 @@ impl McpServer {
         if handlers.insert(method.to_string(), handler).is_some() {
             panic!("Notification handler for method '{}' already registered.", method);
         }
+    }
+
+    pub async fn add_tool(&self, tool: Tool) {
+        let mut tools_guard = self.internal.tools.lock().await;
+        tools_guard.push(tool);
+       eprintln!("Server: Added tool definition '{}'. Current tools: {}",
+                  tools_guard.last().unwrap().name, tools_guard.len());
+    }
+
+    pub async fn register_tool_execution_handler(&self, tool_name: &str, handler: ToolExecutionHandler) {
+        let mut handlers = self.internal.tool_execution_handlers.lock().await;
+        if handlers.insert(tool_name.to_string(), handler).is_some() {
+            panic!("Tool execution handler for '{}' already registered.", tool_name);
+        }
+        eprintln!("Server: Registered execution handler for tool '{}'.", tool_name);
     }
     
      pub async fn run(&self) -> Result<(), McpError> {
@@ -249,6 +307,84 @@ impl McpServer {
         // }
      
         Ok(())
+    }
+
+    pub async fn handle_tools_list(request: Request, server_internal: Arc<McpServerInternal>) -> Result<Response, McpError> {
+        let request_id = request.id.clone();
+        let params: ToolsListRequestParams = serde_json::from_value(request.params.unwrap_or_default())
+            .map_err(|e| McpError::ParseJson(format!("Invalid tools/list params: {}", e)))?;
+        
+        let tools_guard = server_internal.tools.lock().await; // Acquire lock to read tools metadata
+        let tools_list_result = ToolsListResult {
+            tools: tools_guard.clone(), // Clone the vector to return it
+            next_cursor: None, // No pagination implemented in this example
+        };
+
+        eprintln!("Server: Responding to tools/list request with {} tools.", tools_list_result.tools.len());
+
+        Ok(Response::new_success(
+            request_id,
+            Some(serde_json::to_value(tools_list_result).unwrap())
+        ))
+    }
+
+     /// Handles the `tools/call` request from the client.
+    async fn handle_tools_call(request: Request, server_internal: Arc<McpServerInternal>) -> Result<Response, McpError> {
+        let request_id = request.id.clone();
+        let params: ToolsCallRequestParams = serde_json::from_value(request.params.unwrap_or_default())
+            .map_err(|e| McpError::ParseJson(format!("Invalid tools/call parameters: {}", e)))?;
+
+        let tool_name = params.tool_name;
+        // The ToolExecutionHandler expects just the arguments Value, not the whole ToolsCallRequestParams
+        let tool_arguments = params.tool_parameters.unwrap_or_default(); // Default to empty object if None
+
+        let handlers = server_internal.tool_execution_handlers.lock().await;
+
+        if let Some(handler) = handlers.get(&tool_name) {
+            eprintln!("Server: Executing tool '{}' with arguments: {:?}", tool_name, tool_arguments);
+            // Execute the specific tool handler and await its result
+            let tool_output_result = handler(tool_arguments, server_internal.clone()).await;
+
+            // ToolExecutionHandler returns Result<Value, McpError>
+            // We need to convert this into the specific ToolsCallResult structure
+            let call_result = match tool_output_result {
+                Ok(output_value) => {
+                    eprintln!("Server: Tool '{}' raw output: {:?}", tool_name, output_value);
+                    
+                    ToolsCallResult {
+                        content: vec![ToolOutputContentBlock::Text { text: output_value.to_string() }], // Wrap in Text content for generic output
+                        is_error: false,
+                        error_message: None,
+                        structured_content: None, // If tool specifically returns structured JSON
+                        metadata: None,
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Server: Tool '{}' execution failed: {:?}", tool_name, e);
+                    ToolsCallResult {
+                        content: vec![ToolOutputContentBlock::Text { text: format!("Tool execution failed: {}", e) }],
+                        is_error: true,
+                        error_message: Some(format!("Tool execution error: {}", e)),
+                        structured_content: None,
+                        metadata: None,
+                    }
+                }
+            };
+
+            Ok(Response::new_success(
+                request_id,
+                Some(serde_json::to_value(call_result).unwrap()) // Serialize the ToolsCallResult
+            ))
+
+        } else {
+            eprintln!("Server: Tool '{}' not found or no execution handler registered.", tool_name);
+            Ok(Response::new_error(
+                Some(request_id),
+                -32601, // Method not found (or Tool not found, similar semantic)
+                &format!("Tool '{}' not found or execution handler not registered.", tool_name),
+                None,
+            ))
+        }
     }
 
 }

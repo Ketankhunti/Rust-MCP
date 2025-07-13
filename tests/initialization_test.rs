@@ -47,7 +47,7 @@ async fn test_server_client_basic_handshake_and_custom_ping() {
     println!("\n--- Starting test_server_client_basic_handshake_and_custom_ping ---");
 
     // 1. Spawn the server process
-    let mut server_process = Command::new(env!("CARGO_BIN_EXE_simple_server"))
+    let mut server_process = Command::new(env!("CARGO_BIN_EXE_initialization_server"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit()) // Inherit stderr to see server's debug output
