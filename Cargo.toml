@@ -10,6 +10,7 @@ tokio = {version="1.46.0",features = ["full"]}
 thiserror = "2.0.12"
 anyhow = "1.0"
 futures = "0.3.31"
+bytes = "1.10.1"
 
 [[bin]]
 name = "initialization_server"
@@ -19,13 +20,20 @@ path = "examples/initialization_server.rs"
 name = "tools_server"
 path = "examples/tools_server.rs"
 
+[[bin]]
+name = "tcp_server"
+path = "examples/tcp_server.rs"
 
-# Define your integration test suite
-[[test]]
-name = "nitialization_tests" # Name of your test suite
-path = "tests/initialization_test.rs" # Path to your test file
 
-# Define your integration test suite
+
 [[test]]
-name = "tools_tests" # Name of your test suite
-path = "tests/tools_test.rs" # Path to your test file
+name = "nitialization_test" 
+path = "tests/initialization_test.rs"
+
+[[test]]
+name = "tools_test" # Name of your test suite
+path = "tests/tools_test.rs"
+
+[[test]]
+name = "tcp_server_test"
+path = "tests/tcp_server_test.rs"

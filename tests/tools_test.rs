@@ -49,7 +49,7 @@ async fn test_server_client_full_tools_integration() {
     println!("\n--- Starting test_server_client_full_tools_integration ---");
 
     // 1. Spawn the server process
-    let mut server_process = Command::new(env!("CARGO_BIN_EXE_tools_server"))
+    let mut server_process = Command::new(env!("CARGO_BIN_EXE_tools_server")) // Using `simple_server` as previously confirmed
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit()) // Inherit stderr to see server's debug output
@@ -64,7 +64,40 @@ async fn test_server_client_full_tools_integration() {
 
     println!("Test: Server spawned.");
 
-    // 2. Perform Initialize Handshake
+    // --- NEW TEST CASE: Send request BEFORE Initialization ---
+    println!("\n--- Test Case: Sending tools/list request BEFORE initialize ---");
+    let pre_init_request_id = 99; // Unique ID for this test case
+    let pre_init_request = json!({
+        "jsonrpc": "2.0",
+        "id": pre_init_request_id,
+        "method": "tools/list",
+        "params": {}
+    });
+
+    let req_str = pre_init_request.to_string();
+    server_stdin_writer.write_all(req_str.as_bytes()).await.expect("Failed to write pre-init request");
+    server_stdin_writer.write_all(b"\n").await.expect("Failed to write newline");
+    server_stdin_writer.flush().await.expect("Failed to flush after pre-init request");
+    println!("Test: Sent tools/list request BEFORE initialize.");
+
+    let pre_init_response_val = read_json_line(&mut server_stdout_reader).await
+        .expect("Failed to read pre-init response or server closed connection");
+
+    println!("Test: Received pre-init response: {}", pre_init_response_val);
+
+    // Assert that it's an error response indicating handshake not complete
+    assert_eq!(pre_init_response_val["id"], pre_init_request_id, "Response ID should match pre-init request ID.");
+    assert!(pre_init_response_val["error"].is_object(), "Expected an error object for pre-init response.");
+    assert_eq!(pre_init_response_val["error"]["code"].as_i64().unwrap(), -32600, "Expected Invalid Request error code (-32600)."); // -32600 is standard Invalid Request
+    assert!(
+        pre_init_response_val["error"]["message"].as_str().unwrap().contains("Protocol handshake not complete"),
+        "Error message should indicate handshake not complete."
+    );
+    println!("--- Test Case: Pre-init request handled correctly (error returned) ---");
+
+
+    // 2. Perform Initialize Handshake (Original step 2, now adjusted for continuity)
+    println!("\n--- Test: Performing Initialize Handshake ---");
     let initialize_request_id = 0;
     let initialize_request = json!({
         "jsonrpc": "2.0",
@@ -110,7 +143,7 @@ async fn test_server_client_full_tools_integration() {
 
     println!("--- Test: Handshake complete ---");
 
-    // 3. Test tools/list
+    // 3. Test tools/list (Original step 3)
     let tools_list_request_id = 1;
     let tools_list_request = json!({
         "jsonrpc": "2.0",
@@ -138,7 +171,7 @@ async fn test_server_client_full_tools_integration() {
     assert_eq!(tools_array[1]["name"], "weather");
     println!("Test: tools/list verified.");
 
-    // 4. Test tools/call (calculator: add)
+    // 4. Test tools/call (calculator: add) (Original step 4)
     let calc_add_id = 2;
     let calc_add_request = json!({
         "jsonrpc": "2.0",
@@ -163,12 +196,10 @@ async fn test_server_client_full_tools_integration() {
     assert_eq!(calc_add_response["id"], calc_add_id);
     assert_eq!(calc_add_response["result"]["isError"], false);
     assert!(calc_add_response["result"]["content"].as_array().unwrap().len() > 0);
-    // Note: The calculator tool currently returns `json!({"value": result})`
-    // which then gets `to_string()`ed. We check for stringified JSON.
     assert_eq!(calc_add_response["result"]["content"][0]["text"], "{\"value\":8.0}");
     println!("Test: tools/call (calculator add) verified.");
 
-    // 5. Test tools/call (calculator: subtract)
+    // 5. Test tools/call (calculator: subtract) (Original step 5)
     let calc_sub_id = 3;
     let calc_sub_request = json!({
         "jsonrpc": "2.0",
@@ -195,7 +226,7 @@ async fn test_server_client_full_tools_integration() {
     assert_eq!(calc_sub_response["result"]["content"][0]["text"], "{\"value\":8.0}");
     println!("Test: tools/call (calculator subtract) verified.");
 
-    // 6. Test tools/call (weather - not implemented execution handler)
+    // 6. Test tools/call (weather - not implemented execution handler) (Original step 6)
     let weather_id = 4;
     let weather_request = json!({
         "jsonrpc": "2.0",
@@ -219,12 +250,12 @@ async fn test_server_client_full_tools_integration() {
     println!("Test: Received tools/call (weather) response: {}", weather_response);
     assert_eq!(weather_response["id"], weather_id);
     assert!(weather_response["error"].is_object(), "Expected an error response for unimplemented tool.");
-    assert_eq!(weather_response["error"]["code"], -32601); // Method not found / Tool not found
+    assert_eq!(weather_response["error"]["code"], -32601);
     assert!(weather_response["error"]["message"].as_str().unwrap().contains("Tool 'weather' not found or execution handler not registered."));
     println!("Test: tools/call (weather) error verified.");
 
 
-    // 7. Test custom/ping
+    // 7. Test custom/ping (Original step 7)
     let ping_request_id = 5;
     let ping_request = json!({
         "jsonrpc": "2.0",
@@ -250,7 +281,7 @@ async fn test_server_client_full_tools_integration() {
     println!("Test: custom/ping verified.");
 
 
-    // 8. Test a non-existent method
+    // 8. Test a non-existent method (Original step 8)
     let non_existent_id = 6;
     let non_existent_request = json!({
         "jsonrpc": "2.0",

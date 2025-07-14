@@ -1,7 +1,8 @@
 pub mod transport;
 pub mod server;
 pub mod client;
-
+pub mod tcp_transport;
+use std::io::Error;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,8 @@ pub enum McpError{
     UnexpectedMessageType(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Network/Connection error: {0}")]
+    NetworkError(String),
     #[error("Protocol error: {0}")]
     ProtocolError(String),
     #[error("Authentication error: {0}")]
@@ -495,6 +498,7 @@ impl From<u64> for RequestId {
         RequestId::Number(n)
     }
 }
+
 
 // impl From<Option<RequestId>> for RequestId {
 //     fn from(id: Option<RequestId>) -> Self {

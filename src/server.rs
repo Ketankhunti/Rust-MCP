@@ -2,30 +2,51 @@ use std::{collections::HashMap, sync::{Arc}};
 
 use futures::future::BoxFuture;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::{net::TcpListener, sync::Mutex};
 
-use crate::{transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult};
+use crate::{tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult};
 
-type RequestHandler = Arc<
+pub type RequestHandler = Arc<
     dyn Fn(Request, Arc<McpServerInternal>) -> BoxFuture<'static, Result<Response, McpError>>
     + Send
     + Sync,
 >;
 
-type NotificationHandler = Arc<
+pub type NotificationHandler = Arc<
     dyn Fn(Notification, Arc<McpServerInternal>) -> BoxFuture<'static, Result<(), McpError>>
     + Send
     + Sync,
 >;
 
-type ToolExecutionHandler = Arc<
+pub type ToolExecutionHandler = Arc<
     dyn Fn(Value, Arc<McpServerInternal>) -> BoxFuture<'static, Result<Value, McpError>>
     + Send
     + Sync
 >; 
 
+pub enum TransportHandle {
+    Stdio(StdioTransport),
+    Tcp(TcpTransport),
+}
+
+impl TransportHandle {
+    pub async fn send(&mut self, message: McpMessage) -> Result<(), McpError> {
+        match self {
+            TransportHandle::Stdio(t) => t.send(message).await,
+            TransportHandle::Tcp(t) => t.send(message).await,
+        }
+    }
+
+    pub async fn recv(&mut self) -> Result<McpMessage, McpError> {
+        match self {
+            TransportHandle::Stdio(t) => t.recv().await,
+            TransportHandle::Tcp(t) => t.recv().await,
+        }
+    }
+}
+
 pub struct McpServerInternal {
-    pub transport: Mutex<StdioTransport>,
+    pub transport: Mutex<TransportHandle>,
     pub request_handlers: Mutex<HashMap<String, RequestHandler>>,
     pub notification_handlers: Mutex<HashMap<String, NotificationHandler>>,
     pub current_protocol_version: String,
@@ -45,6 +66,7 @@ pub struct McpServer {
 impl McpServer {
     const LATEST_SUPPORTED_PROTOCOL_VERSION: &'static str = "2025-06-18";
     pub async fn new(
+        transport_handle: TransportHandle,
         server_name: String,
         server_version: Option<String>,
         mut server_capabilities: ServerCapabilities,
@@ -62,7 +84,7 @@ impl McpServer {
         }
 
         let internal = Arc::new(McpServerInternal {
-            transport: Mutex::new(StdioTransport::new()),
+            transport: Mutex::new(transport_handle),
             request_handlers: Mutex::new(HashMap::new()),
             notification_handlers: Mutex::new(HashMap::new()),
             current_protocol_version: Self::LATEST_SUPPORTED_PROTOCOL_VERSION.to_string(),
@@ -75,50 +97,119 @@ impl McpServer {
         });
        let server = Self { internal };
 
-       let internal_for_init = server.internal.clone();
        server.register_request_handler(
         "initialize", 
-           Arc::new(move |request, _| {
-               Box::pin(McpServer::handle_initialize(request, internal_for_init.clone()))
+           Arc::new(move |request, server_state| {
+               Box::pin(McpServer::handle_initialize(request, server_state))
            })
        ).await;
 
-       let internal_for_initialized: Arc<McpServerInternal> = server.internal.clone();
         server.register_notification_handler(
             "notifications/initialized",
-            Arc::new(move |notification, _| {
-                Box::pin(McpServer::handle_initialized_notification(notification, internal_for_initialized.clone()))
+            Arc::new(move |notification, server_state| {
+                Box::pin(McpServer::handle_initialized_notification(notification, server_state))
             })
         ).await;
 
         // Refister tools/list
-        let  internal_for_tools_list = server.internal.clone();
-
         server.register_request_handler(
             "tools/list",
-            Arc::new(move |request, _| {
-            let internal = internal_for_tools_list.clone();
+            Arc::new(move |request, server_state| {
             Box::pin(async move {
-                McpServer::handle_tools_list(request, internal).await
+                    McpServer::handle_tools_list(request, server_state).await
+                })
             })
-        })
         )
         .await;
 
         // Register the `tools/call` request handler
-        let internal_for_tools_call = server.internal.clone();
         server.register_request_handler(
             "tools/call",
-            Arc::new(move |request, _| {
-                let internal = internal_for_tools_call.clone();
+            Arc::new(move |request, server_state| {
                 Box::pin(async move {
-                    McpServer::handle_tools_call(request, internal).await
+                    McpServer::handle_tools_call(request, server_state).await
                 })
             })
         ).await;
 
         server
 
+    }
+
+    // Helper constructor for Stdio Transport (for backward compatibility)
+    pub async fn start_stdio_server(
+        server_name: String,
+        server_version: Option<String>,
+        server_capabilities: ServerCapabilities,
+        instructions: Option<String>,
+    ) -> Self {
+        let stdio_transport = StdioTransport::new();
+        Self::new(
+            TransportHandle::Stdio(stdio_transport),
+            server_name,
+            server_version,
+            server_capabilities,
+            instructions,
+        ).await
+    }
+
+    pub async fn start_tcp_server(
+        addr: &str,
+        server_name: String,
+        server_version: Option<String>,
+        server_capabilities: ServerCapabilities,
+        instructions: Option<String>,
+        tool_definitions: Vec<Tool>,
+        tool_execution_handlers: Vec<(String, ToolExecutionHandler)>,
+        custom_request_handlers: Vec<(String, RequestHandler)>,
+        custom_notification_handlers: Vec<(String, NotificationHandler)>,
+    ) -> Result<(), McpError> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| McpError::NetworkError(format!("Failed to bind TCP listener to {}: {}", addr, e).into()))?;
+
+        eprintln!("Server: TCP server started on {}", addr);
+
+        loop {
+            let (stream, peer_addr) = listener.accept().await
+            .map_err(|e| McpError::NetworkError(format!("Failed to accept TCP connection: {}", e).into()))?;
+            eprintln!("Server: Accepted TCP connection from {}", peer_addr);
+
+            //Create a new McpServer instance (protocol handler) for *this specific connection*.
+            // Each client connection gets its own isolated protocol state.
+            let connection_server = McpServer::new(
+                TransportHandle::Tcp(TcpTransport::new(stream)),
+                server_name.clone(),
+                server_version.clone(),
+                server_capabilities.clone(),
+                instructions.clone(),
+            ).await;
+
+            // register all handlers
+            for tool_def in tool_definitions.iter() {
+                connection_server.add_tool(tool_def.clone()).await;
+            }
+            for (tool_name, handler) in tool_execution_handlers.iter() {
+                connection_server.register_tool_execution_handler(tool_name, handler.clone()).await;
+            }
+            // Register custom request/notification handlers
+            for (method, handler) in custom_request_handlers.iter() {
+                connection_server.register_request_handler(method, handler.clone()).await;
+            }
+            for (method, handler) in custom_notification_handlers.iter() {
+                connection_server.register_notification_handler(method, handler.clone()).await;
+            }
+
+            // spawn new task to handle this client
+            tokio::spawn(async move {
+                eprintln!("Server: New task spawned for connection from {}", peer_addr);
+                if let Err(e) = connection_server.run().await { // `connection_server.run()` drives the per-client protocol.
+                    eprintln!("Server: Connection handler for {} terminated with error: {:?}", peer_addr, e);
+                }
+                eprintln!("Server: Connection handler for {} finished.", peer_addr);
+            });
+
+        }
     }
 
     pub async fn register_request_handler(&self, method: &str, handler : RequestHandler ) {
@@ -196,12 +287,31 @@ impl McpServer {
                     let response = match response_result {
                         Ok(res) => res,
                         Err(err) => {
-                            eprintln!("Server: Handler for '{}' returned an error: {:?}", method, err);
+                                   eprintln!("Server: Handler for '{}' returned an error: {:?}", method, err);
+
+                            // --- NEW: Specific Error Mapping ---
+                            let (error_code, error_message, error_data) = match err {
+                                McpError::ProtocolError(msg) => {
+                                    // For known protocol violations, use -32600 (Invalid Request)
+                                    (-32600, msg, None)
+                                },
+                                // Add more specific mappings for other McpError types if needed
+                                McpError::ParseJson(msg) => {
+                                    // If parsing handler's params failed, could be InvalidParams
+                                    (-32602, msg, None) // -32602 is Invalid Params
+                                },
+                                // Default for any other unexpected internal server error
+                                _ => {
+                                    (-32000, format!("Internal server error: {}", err), None)
+                                }
+                            };
+                            // --- End Specific Error Mapping ---
+
                             Response::new_error(
                                 Some(id), // ID is present for requests
-                                -32000,
-                                &format!("Internal server error: {}", err),
-                                None,
+                                error_code,
+                                &error_message,
+                                error_data,
                             )
                         }
                     };
@@ -310,6 +420,15 @@ impl McpServer {
     }
 
     pub async fn handle_tools_list(request: Request, server_internal: Arc<McpServerInternal>) -> Result<Response, McpError> {
+        
+        let negotiated_version_guard = server_internal.negotiated_protocol_version.lock().await;
+        if negotiated_version_guard.is_none() {
+            // Return an error if handshake is not complete
+            return Err(McpError::ProtocolError(
+                "Protocol handshake not complete. Please send 'initialize' request first.".to_string()
+            ));
+        }
+
         let request_id = request.id.clone();
         let params: ToolsListRequestParams = serde_json::from_value(request.params.unwrap_or_default())
             .map_err(|e| McpError::ParseJson(format!("Invalid tools/list params: {}", e)))?;
@@ -330,6 +449,15 @@ impl McpServer {
 
      /// Handles the `tools/call` request from the client.
     async fn handle_tools_call(request: Request, server_internal: Arc<McpServerInternal>) -> Result<Response, McpError> {
+        
+        let negotiated_version_guard = server_internal.negotiated_protocol_version.lock().await;
+        if negotiated_version_guard.is_none() {
+            // Return an error if handshake is not complete
+            return Err(McpError::ProtocolError(
+                "Protocol handshake not complete. Please send 'initialize' request first.".to_string()
+            ));
+        }
+        
         let request_id = request.id.clone();
         let params: ToolsCallRequestParams = serde_json::from_value(request.params.unwrap_or_default())
             .map_err(|e| McpError::ParseJson(format!("Invalid tools/call parameters: {}", e)))?;

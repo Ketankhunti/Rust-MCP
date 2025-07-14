@@ -292,6 +292,7 @@ name = "rust_mcp_sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures",
  "serde",
  "serde_json",

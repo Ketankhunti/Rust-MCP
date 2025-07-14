@@ -1,3 +1,4 @@
+// examples/simple_server.rs
 
 use rust_mcp_sdk::server::{McpServer, McpServerInternal};
 use rust_mcp_sdk::{ServerCapabilities, ServerInfo, McpError, Tool, InputSchema, ToolsCallRequestParams, ToolsCallResult, ToolOutputContentBlock};
@@ -6,7 +7,6 @@ use anyhow::Result;
 use std::sync::Arc;
 
 // Define a concrete implementation for the "calculator" tool
-// This function performs the actual calculation logic.
 async fn execute_calculator_tool(params: Value, _server_internal: Arc<McpServerInternal>) -> Result<Value, McpError> {
     eprintln!("Server: Executing calculator tool with params: {:?}", params);
 
@@ -25,55 +25,41 @@ async fn execute_calculator_tool(params: Value, _server_internal: Arc<McpServerI
 
     eprintln!("Server: Calculator raw result: {}", result);
 
-    // Return the raw result as a JSON Value, which handle_tools_call will then wrap
     Ok(json!({"value": result}))
 }
 
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    eprintln!("Starting MCP Server example (with Tools Call functionality)...");
+    eprintln!("Starting MCP Server example (Stdio Mode)...");
 
-    // Define the server's capabilities.
-    // Ensure `tools` capability is advertised.
     let server_capabilities = ServerCapabilities {
         logging: Some(json!({})),
         prompts: None,
         resources: None,
-        tools: Some(rust_mcp_sdk::ServerToolsCapability { list_changed: Some(true) }), // Advertise tools support
+        tools: Some(rust_mcp_sdk::ServerToolsCapability { list_changed: Some(true) }),
         completions: None,
         experimental: None,
     };
 
-    // Create a new server instance
-    let server = McpServer::new(
+    // Use the new new_stdio_server constructor
+    let server = McpServer::start_stdio_server(
         "RustMcpSdkExampleServer".to_string(),
         Some(env!("CARGO_PKG_VERSION").to_string()),
         server_capabilities,
         Some("This is a simple Rust MCP server example. It handles initialize, custom/ping, tools/list, and tools/call.".to_string()),
-    ).await; // new() is async, so await it
+    ).await;
 
     // --- TOOL DEFINITION AND REGISTRATION ---
-
-    // 1. Add Tool Metadata (for tools/list request)
-    // This defines the tool's public API and description.
     server.add_tool(Tool {
         name: "calculator".to_string(),
         title: Some("Simple Arithmetic Calculator".to_string()),
         description: "A tool to perform basic addition and subtraction.".to_string(),
         input_schema: InputSchema::Inline(json!({
-            "type": "object",
-            "properties": {
-                "operation": {"type": "string", "enum": ["add", "subtract"]},
-                "a": {"type": "number"},
-                "b": {"type": "number"}
-            },
-            "required": ["operation", "a", "b"]
+            "type": "object", "properties": {"operation": {"type": "string", "enum": ["add", "subtract"]}, "a": {"type": "number"}, "b": {"type": "number"}}, "required": ["operation", "a", "b"]
         })),
-        output_schema: Some(InputSchema::Inline(json!({"type": "object", "properties": {"value": {"type": "number"}}}))), // Output schema for 'value'
-        requires_auth: Some(false),
-        annotations: None,
-        experimental: None,
+        output_schema: Some(InputSchema::Inline(json!({"type": "object", "properties": {"value": {"type": "number"}}}))),
+        requires_auth: Some(false), annotations: None, experimental: None,
     }).await;
 
     server.add_tool(Tool {
@@ -81,28 +67,18 @@ async fn main() -> Result<()> {
         title: Some("Current Weather Fetcher".to_string()),
         description: "Fetches current weather information for a location. (Note: Execution not implemented for this tool)".to_string(),
         input_schema: InputSchema::Inline(json!({
-            "type": "object",
-            "properties": {
-                "location": {"type": "string", "description": "City name or zip code"}
-            },
-            "required": ["location"]
+            "type": "object", "properties": {"location": {"type": "string", "description": "City name or zip code"}}, "required": ["location"]
         })),
         output_schema: Some(InputSchema::Inline(json!({"type": "object", "properties": {"temperature": {"type": "number"}}}))),
-        requires_auth: Some(false),
-        annotations: None,
-        experimental: None,
+        requires_auth: Some(false), annotations: None, experimental: None,
     }).await;
 
-
-    // 2. Register Tool Execution Handlers (for tools/call request)
-    // This provides the actual Rust function that runs the tool's logic.
-    let internal_for_calculator = server.internal.clone();
     server.register_tool_execution_handler(
         "calculator",
-        Arc::new(move |params, _| {
-            let internal = internal_for_calculator.clone();
+        Arc::new(move |params, _server_state| {
+             // _server_state is fine here if not used
             Box::pin(async move {
-                execute_calculator_tool(params, internal).await // Pass params to tool func
+                execute_calculator_tool(params, _server_state).await
             })
         })
     ).await;
@@ -110,14 +86,24 @@ async fn main() -> Result<()> {
     // --- OTHER HANDLERS (non-tool specific) ---
 
     // Register the custom/ping handler (for testing general requests)
-    let internal_for_custom = server.internal.clone();
     server.register_request_handler(
         "custom/ping",
-        Arc::new(move |request, _| {
-            let internal = internal_for_custom.clone();
+        Arc::new(move |request, server_state| {
             Box::pin(async move {
+                // --- Negotiation Check within the closure (as per earlier discussion) ---
+                let negotiated_version_guard = server_state.negotiated_protocol_version.lock().await;
+                if negotiated_version_guard.is_none() {
+                    return Ok(rust_mcp_sdk::Response::new_error(
+                        Some(request.id),
+                        -32600,
+                        &"Protocol handshake not complete. Please send 'initialize' request first.".to_string(),
+                        None,
+                    ));
+                }
+                // --- End Negotiation Check ---
+
                 eprintln!("Server: Received custom/ping request: {:?}", request);
-                let current_negotiated_version = internal.negotiated_protocol_version.lock().await;
+                let current_negotiated_version = server_state.negotiated_protocol_version.lock().await;
                 eprintln!("Server: Negotiated protocol version (in custom handler): {:?}", *current_negotiated_version);
 
                 Ok(rust_mcp_sdk::Response::new_success(
@@ -128,10 +114,8 @@ async fn main() -> Result<()> {
         })
     ).await;
 
-
     eprintln!("Server initialized. Listening for client connections on stdin/stdout...");
 
-    // Run the server loop. This keeps the server alive and processing messages.
     if let Err(e) = server.run().await {
         eprintln!("Server run loop terminated with error: {:?}", e);
     }

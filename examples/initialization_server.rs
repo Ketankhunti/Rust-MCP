@@ -1,5 +1,6 @@
 // examples/simple_server.rs
-use rust_mcp_sdk::server::{McpServer, McpServerInternal};
+use rust_mcp_sdk::server::{McpServer, McpServerInternal, TransportHandle};
+use rust_mcp_sdk::transport::StdioTransport;
 use rust_mcp_sdk::{ServerCapabilities, ServerInfo, McpError};
 use serde_json::json;
 use anyhow::Result;
@@ -21,6 +22,7 @@ async fn main() -> Result<()> {
 
     // Create a new server instance
     let server = McpServer::new(
+        TransportHandle::Stdio(StdioTransport::new()),
         "RustMcpSdkExampleServer".to_string(),
         Some(env!("CARGO_PKG_VERSION").to_string()),
         server_capabilities,
