@@ -1,15 +1,20 @@
+use crate::server::TransportHandle;
 use crate::{McpError, McpMessage, Request, RequestId, Response, ClientCapabilities, ClientInfo, InitializeResult, ServerCapabilities, Notification};
 use crate::transport::StdioTransport;
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
+use tokio::time::timeout;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::u64;
 use anyhow::Result;
 use serde_json::Value;
 
 struct PendingRequest {
     sender: oneshot::Sender<Result<Response, McpError>>,
+    creation_time: Instant
 }
 
 pub struct McpClient {
@@ -18,19 +23,40 @@ pub struct McpClient {
     pending_requests: Arc<Mutex<HashMap<RequestId, PendingRequest>>>,
     current_protocol_version: String,
     negotiated_protocol_version: Arc<Mutex<Option<String>>>,
+    default_request_timeout: Duration
 }
 
 impl McpClient {
     const LATEST_SUPPORTED_PROTOCOL_VERSION: &'static str = "2025-06-18";
-
-    pub fn new() -> Self {
+    const DEFAULT_REQUEST_TIMEOUT: u64 = 30; // 30 seconds
+    pub fn new( transport_handle: TransportHandle) -> Self {
         McpClient {
             transport: StdioTransport::new(),
             next_request_id: Arc::new(Mutex::new(0)),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             current_protocol_version: Self::LATEST_SUPPORTED_PROTOCOL_VERSION.to_string(),
             negotiated_protocol_version: Arc::new(Mutex::new(None)),
+            default_request_timeout: Duration::from_secs(Self::DEFAULT_REQUEST_TIMEOUT),
         }
+    }
+
+    pub async fn start_stdio_client() -> Self {
+        let stdio_transport = StdioTransport::new();
+        Self::new(TransportHandle::Stdio(stdio_transport))
+    }
+
+    pub async fn start_tcp_client(addr: &str) -> Result<Self, McpError> {
+        let stream = TcpStream::connect(addr).await
+            .map_err(|e| McpError::NetworkError(format!("Failed to connect to {}: {}", addr, e)))?;
+        eprintln!("Client: Connected to TCP server at {}", addr);
+        Ok(Self::new(
+            TransportHandle::Tcp(crate::tcp_transport::TcpTransport::new(stream)), // Use fully qualified path
+        ))
+    }
+
+    pub fn with_default_timeout(mut self, duration: Duration) -> Self {
+        self.default_request_timeout = duration;
+        self
     }
 
     pub async fn run(&mut self) -> Result<(), McpError> {
@@ -73,13 +99,27 @@ impl McpClient {
 
         {
             let mut pending_requests = self.pending_requests.lock().unwrap();
-            pending_requests.insert(id.clone(), PendingRequest { sender: tx });
+            pending_requests.insert(id.clone(), PendingRequest { sender: tx, creation_time: Instant::now() });
         }
 
         self.transport.send(McpMessage::Request(request)).await?;
 
-        // TODO: Implement timeout here using `tokio::time::timeout`.
-        rx.await.map_err(McpError::OneshotRecv)?
+        
+        match timeout(self.default_request_timeout, rx).await {
+            Ok(Ok(response)) => {
+                response
+            },
+            Ok(Err(recv_error)) => {
+                Err(McpError::OneshotRecv(recv_error))
+            },
+            Err(_) => {
+                let mut pending_requests = self.pending_requests.lock().unwrap();
+                pending_requests.remove(&id);
+                eprintln!("Client: Request ID {:?} for method '{}' timed out after {:?}.", id, method, self.default_request_timeout);
+                Err(McpError::RequestTimeout)
+            }
+        }
+
     }
 
     async fn handle_message(&self, message: McpMessage) -> Result<(), McpError> {

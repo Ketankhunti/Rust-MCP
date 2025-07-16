@@ -1,6 +1,7 @@
 // examples/simple_client.rs
 
 use rust_mcp_sdk::client::McpClient;
+use rust_mcp_sdk::transport::StdioTransport;
 use rust_mcp_sdk::{ClientCapabilities, ClientInfo, ClientRootsCapability};
 use tokio::task;
 use anyhow::Result;
@@ -11,7 +12,7 @@ async fn main() -> Result<()> {
     println!("Starting MCP Client example...");
 
     // Create a new client instance
-    let mut client = McpClient::new();
+    let mut client = McpClient::new(rust_mcp_sdk::server::TransportHandle::Stdio(StdioTransport::new()));
     // Spawn the client's main loop in a background task.
     // This task will handle all incoming messages from the server.
     

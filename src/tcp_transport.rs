@@ -11,7 +11,7 @@ pub struct TcpTransport {
 }
 
 impl TcpTransport {
-    pub fn new(stream: TcpStream) -> Self {
+    pub  fn new(stream: TcpStream) -> Self {
         TcpTransport {
             stream,
             read_buffer: BytesMut::with_capacity(4096), // initial capacity of 4096 bytes

@@ -6,8 +6,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 // Use rust_mcp_sdk as the crate name
 use rust_mcp_sdk::tcp_transport::TcpTransport;
-use rust_mcp_sdk::{ClientCapabilities, ClientInfo, ClientRootsCapability, ToolsListResult, ToolsCallRequestParams, ToolsCallResult};
-use rust_mcp_sdk::{Request, Notification, Response}; // Explicitly import Request and Notification for McpMessage::new calls
+use rust_mcp_sdk::{Request, Notification}; // Explicitly import Request and Notification for McpMessage::new calls
 
 // The address the TCP server will listen on and the client will connect to.
 const SERVER_ADDR: &str = "127.0.0.1:8080";
