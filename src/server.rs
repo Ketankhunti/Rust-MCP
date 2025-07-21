@@ -1,33 +1,43 @@
-use std::{collections::HashMap, sync::{Arc}};
+use std::{collections::HashMap, hash::Hash, net::SocketAddr, sync::Arc, time::Duration};
 
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::{get, get_service, post, post_service}, Json, Router};
 use futures::future::BoxFuture;
 use serde_json::Value;
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{net::TcpListener, sync::{mpsc, oneshot, Mutex}, task};
+use uuid::Uuid;
+use axum::response::Response as AxumResponse;
 
-use crate::{tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult};
+use crate::{tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult};
 
 pub type RequestHandler = Arc<
-    dyn Fn(Request, Arc<McpServerInternal>) -> BoxFuture<'static, Result<Response, McpError>>
+    dyn Fn(Request, Arc<McpSessionInternal>, Arc<McpServer>) -> BoxFuture<'static, Result<Response, McpError>>
     + Send
     + Sync,
 >;
 
 pub type NotificationHandler = Arc<
-    dyn Fn(Notification, Arc<McpServerInternal>) -> BoxFuture<'static, Result<(), McpError>>
+    dyn Fn(Notification, Arc<McpSessionInternal>, Arc<McpServer>) -> BoxFuture<'static, Result<(), McpError>>
     + Send
     + Sync,
 >;
 
 pub type ToolExecutionHandler = Arc<
-    dyn Fn(Value, Arc<McpServerInternal>) -> BoxFuture<'static, Result<Value, McpError>>
+    dyn Fn(Value, Arc<McpSessionInternal>, Arc<McpServer>) -> BoxFuture<'static, Result<Value, McpError>>
     + Send
     + Sync
 >; 
 
+pub enum ServerTransportConfig{
+    Stdio,
+    Tcp(String),
+    Http(String),   // address to listen on
+}
+
 pub enum TransportHandle {
     Stdio(StdioTransport),
-    Tcp(TcpTransport),
+    Tcp(TcpTransport)
 }
+
 
 impl TransportHandle {
     pub async fn send(&mut self, message: McpMessage) -> Result<(), McpError> {
@@ -45,445 +55,581 @@ impl TransportHandle {
     }
 }
 
-pub struct McpServerInternal {
-    pub transport: Mutex<TransportHandle>,
-    pub request_handlers: Mutex<HashMap<String, RequestHandler>>,
-    pub notification_handlers: Mutex<HashMap<String, NotificationHandler>>,
+pub struct McpServer {
+    pub server_name: String,
+    pub title: Option<String>,
+    pub server_version: Option<String>,
+    pub server_capabilities: ServerCapabilities,
+    pub instructions: Option<String>,
+    pub current_protocol_version: String, // Global protocol version for this server app
+
+    // Global handler maps, defined by the SDK user
+    pub tool_definitions: Mutex<Vec<Tool>>, // Stores metadata about tools (for tools/list)
+    pub tool_execution_handler_registrations: Mutex<HashMap<String, ToolExecutionHandler>>, // Stores execution logic for tools
+    pub custom_request_handlers: Mutex<HashMap<String, RequestHandler>>, // User-defined request handlers
+    pub custom_notification_handlers: Mutex<HashMap<String, NotificationHandler>>, // User-defined notification handlers
+}
+
+impl McpServer {
+
+    const LATEST_SUPPORTED_PROTOCOL_VERSION: &'static str = "2025-06-18";
+
+    /// Creates a new McpServer application instance.
+    /// This is the entry point for defining the server's capabilities and handlers.
+    pub async fn new(
+        server_name: String,
+        title: Option<String>,
+        server_version: Option<String>,
+        mut server_capabilities: ServerCapabilities,
+        instructions: Option<String>,
+    ) -> Self {
+        if server_capabilities.tools.is_none() {
+             server_capabilities.tools = Some(crate::ServerToolsCapability { list_changed: Some(true) });
+        }
+
+        let mut server = McpServer { // Create the struct
+            server_name,
+            title,
+            server_version,
+            server_capabilities,
+            instructions,
+            current_protocol_version: Self::LATEST_SUPPORTED_PROTOCOL_VERSION.to_string(),
+            tool_definitions: Mutex::new(Vec::new()),
+            tool_execution_handler_registrations: Mutex::new(HashMap::new()),
+            custom_request_handlers: Mutex::new(HashMap::new()),
+            custom_notification_handlers: Mutex::new(HashMap::new()),
+        };
+
+        
+        server
+
+    }
+
+    pub async fn register_request_handler(&self, method: &str, handler: RequestHandler) {
+        let mut handlers = self.custom_request_handlers.lock().await;
+        if handlers.contains_key(method) {
+            panic!("Request handler for method '{}' already registered.", method);
+        }
+        handlers.insert(method.to_string(), handler);
+    }
+
+    pub async fn register_notification_handler(&self, method: &str, handler: NotificationHandler) {
+        let mut handlers = self.custom_notification_handlers.lock().await;
+        if handlers.contains_key(method) {
+            panic!("Notification handler for method '{}' already registered.", method);
+        }
+        handlers.insert(method.to_string(), handler);
+    }
+
+    pub async fn add_tool(&self, tool: Tool) { // `&mut self`
+        let mut tools_guard = self.tool_definitions.lock().await;
+        tools_guard.push(tool);
+        eprintln!("Server: Added tool definition '{}'. Current tools: {}",
+                  tools_guard.last().unwrap().name, tools_guard.len());
+    }
+
+    pub async fn register_tool_execution_handler(&self, tool_name: &str, handler: ToolExecutionHandler) { // `&mut self`
+        let mut handlers = self.tool_execution_handler_registrations.lock().await;
+        if handlers.contains_key(tool_name) {
+            panic!("Tool execution handler for '{}' already registered.", tool_name);
+        }
+        handlers.insert(tool_name.to_string(), handler);
+        eprintln!("Server: Registered execution handler for tool '{}'.", tool_name);
+    }
+
+    pub async fn start(
+        self: Arc<Self>, // McpServer is passed as Arc<Self> (the global application config)
+        config: ServerTransportConfig
+    ) -> Result<(), McpError> {
+
+        match  config {
+            ServerTransportConfig::Stdio => {
+                eprintln!("Starting Stdio Server...");
+
+                let (incoming_tx, incoming_rx) = mpsc::channel(100);
+                let (outgoing_tx, mut outgoing_rx) = mpsc::channel(100);
+
+                // spawn bridge task
+                let app_config = self.clone();
+                task::spawn(async move {
+                    let mut stdio_transport  = StdioTransport::new();
+                    loop {
+                        tokio::select! {
+                            incoming_msg = stdio_transport.recv() => {
+                                match incoming_msg {
+                                    Ok(msg) => {
+                                        if let Err(e) = incoming_tx.send(msg).await {
+                                            eprintln!("Stdio bridge: Failed to send incoming msg to session: {:?}", e); 
+                                            break;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        eprintln!("Stdio bridge: Recv from transport error: {:?}", e); 
+                                        break;
+                                    }
+                                }
+                            },
+                            outgoing_msg = outgoing_rx.recv() => {
+                                match outgoing_msg {
+                                    Some(msg) => {
+                                        if let Err(e) = stdio_transport.send(msg).await {
+                                            eprintln!("Stdio bridge: Failed to send outgoing msg from session: {:?}", e); 
+                                            break;
+                                        }
+                                    },
+                                    None => {
+                                        eprintln!("Stdio bridge: Outgoing channel closed."); 
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    eprintln!("Stdio bridge task finished.");
+                });
+
+                let session_handler = McpSessionHandler::new(
+                    self.server_name.clone(),
+                    self.title.clone(),
+                    self.server_version.clone(),
+                    self.server_capabilities.clone(),
+                    self.instructions.clone(),
+                    incoming_rx,
+                    outgoing_tx,
+                    app_config, // Pass Arc<McpServer> (global app config)
+                ).await;
+
+                session_handler.process_incoming_messages().await?
+
+            }
+
+            ServerTransportConfig::Tcp(addr) => {
+                eprintln!("Starting TCP server on {}", addr);
+                let listener = tokio::net::TcpListener::bind(&addr).await
+                .map_err(|e| McpError::NetworkError(format!("Failed to bind TCP listener to {}: {}", addr, e)))?;
+
+                eprintln!("TCP server started on {}", addr);
+
+                loop {
+                    let (stream, peer_addr) = listener.accept().await
+                    .map_err(|e| McpError::NetworkError(format!("Failed to accept TCP connection: {}", e)))?;
+                    eprintln!("Server: Accepted connection from {}", peer_addr);
+
+                    let (incoming_tx, incoming_rx) = mpsc::channel(100);
+                    let (outgoing_tx, mut outgoing_rx) = mpsc::channel(100);
+
+                    let session_handler = McpSessionHandler::new(
+                        self.server_name.clone(),
+                        self.title.clone(),
+                        self.server_version.clone(),
+                        self.server_capabilities.clone(),
+                        self.instructions.clone(),
+                        incoming_rx,
+                        outgoing_tx,
+                        self.clone(), // Pass Arc<McpServer> (global app config)
+                    ).await;
+
+                    // spawn task to run core MCP protocol logic for this session
+                    task::spawn(async move {
+                        eprintln!("Server: Session logic task spawned for {}", peer_addr);
+                        if let Err(e) = session_handler.process_incoming_messages().await {
+                            eprintln!("Server: Session logic for {} terminated with error: {:?}", peer_addr, e);
+                        }
+                        eprintln!("Server: Session logic for {} finished.", peer_addr);
+                    });
+
+                    // spawn task to handler TCP I/O bridging for this session
+                    task::spawn(async move {
+                        eprintln!("Server: I/O task spawned for {}", peer_addr);
+                        let mut tcp_transport = Mutex::new(TcpTransport::new(stream));
+
+                        loop {
+                            tokio::select! {
+                                incoming_msg = async {
+                                    let mut guard = tcp_transport.lock().await;
+                                    guard.recv().await
+                                } => {
+                                    match incoming_msg {
+                                        Ok(msg) => {
+                                            if let Err(e) = incoming_tx.send(msg).await {
+                                                eprintln!("HTTP Server: Failed to send TCP msg to session ({}): {:?}", peer_addr, e); 
+                                                break;
+                                            }
+                                        },
+                                        Err(e) => { 
+                                            eprintln!("HTTP Server: TCP recv error ({}): {:?}", peer_addr, e); 
+                                            break; 
+                                        }
+                                    }
+                                },
+                                outgoing_msg = outgoing_rx.recv() => {
+                                    match outgoing_msg {
+                                        Some(msg) => {
+                                            if let Err(e) = tcp_transport.lock().await.send(msg).await {
+                                                eprintln!("HTTP Server: Failed to send outgoing msg from session to TCP ({}): {:?}", peer_addr, e); break;
+                                            }
+                                        },
+                                        None => { eprintln!("HTTP Server: Session outgoing channel closed ({}).", peer_addr); break; }
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                }
+            },
+            ServerTransportConfig::Http(addr) => {
+                eprintln!("Server: Streamable HTTP listener on {}. (Starting Axum server)", addr);
+            // Call the dedicated HTTP listener function
+            McpHttpServer::start_listener(
+                &addr,
+                self.clone(), // Pass Arc<McpServer> (global app config)
+            ).await?;
+
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub struct McpSessionInternal {
+   
+    // pub request_handlers: Mutex<HashMap<String, RequestHandler>>,
+    // pub notification_handlers: Mutex<HashMap<String, NotificationHandler>>,
     pub current_protocol_version: String,
     pub negotiated_protocol_version: Mutex<Option<String>>,
     pub server_capabilities: ServerCapabilities,
     pub server_info: ServerInfo,
     pub instructions: Option<String>,
-    pub tools: Mutex<Vec<Tool>>,
-    pub tool_execution_handlers: Mutex<HashMap<String, ToolExecutionHandler>>,
+    // pub tools: Mutex<Vec<Tool>>,
+    // pub tool_execution_handlers: Mutex<HashMap<String, ToolExecutionHandler>>,
+    pub incoming_rx: Mutex<mpsc::Receiver<McpMessage>>,
+    pub outgoing_tx: mpsc::Sender<McpMessage>,
+
+    pending_outgoing_server_requests: Mutex<HashMap<RequestId,oneshot::Sender<Result<Response,McpError>>>>,
+    next_outgoing_server_request_id: Mutex<u64>,
+    pub http_response_map: Mutex<HashMap<RequestId, oneshot::Sender<Result<Response, McpError>>>>,
+
 }
 
-#[derive(Clone)]
-pub struct McpServer {
-    pub internal: Arc<McpServerInternal>,
+pub struct McpSessionHandler{
+    pub internal: Arc<McpSessionInternal>,
+    pub session_id: Uuid,
+    pub app_config: Arc<McpServer>
 }
 
-impl McpServer {
+impl McpSessionHandler {
     const LATEST_SUPPORTED_PROTOCOL_VERSION: &'static str = "2025-06-18";
+
     pub async fn new(
-        transport_handle: TransportHandle,
         server_name: String,
+        title: Option<String>,
         server_version: Option<String>,
         mut server_capabilities: ServerCapabilities,
         instructions: Option<String>,
+        incoming_rx: mpsc::Receiver<McpMessage>,
+        outgoing_tx: mpsc::Sender<McpMessage>,
+        app_config: Arc<McpServer>
     ) -> Self {
+
         let server_info = ServerInfo {
             name: server_name,
-            title: None, // Can be set later or via constructor arg
-            version: server_version,
+            title: title.clone(),
+            version: server_version
         };
 
-        // Ensure tools capability is advertised if not already present
         if server_capabilities.tools.is_none() {
-             server_capabilities.tools = Some(crate::ServerToolsCapability { list_changed: Some(true) });
+            server_capabilities.tools = Some(crate::ServerToolsCapability { list_changed: Some(true) });
         }
 
-        let internal = Arc::new(McpServerInternal {
-            transport: Mutex::new(transport_handle),
-            request_handlers: Mutex::new(HashMap::new()),
-            notification_handlers: Mutex::new(HashMap::new()),
+        let internal = Arc::new(McpSessionInternal {
             current_protocol_version: Self::LATEST_SUPPORTED_PROTOCOL_VERSION.to_string(),
             negotiated_protocol_version: Mutex::new(None),
             server_capabilities,
-            server_info: server_info,
+            server_info,
             instructions,
-            tools: Mutex::new(Vec::new()), // Initialize with an empty vector
-            tool_execution_handlers: Mutex::new(HashMap::new()), // Initialize with an empty map
+            incoming_rx: Mutex::new(incoming_rx),
+            outgoing_tx: outgoing_tx,
+            pending_outgoing_server_requests: Mutex::new(HashMap::new()),
+            next_outgoing_server_request_id: Mutex::new(0),
+            http_response_map: Mutex::new(HashMap::new()),
         });
-       let server = Self { internal };
 
-       server.register_request_handler(
-        "initialize", 
-           Arc::new(move |request, server_state| {
-               Box::pin(McpServer::handle_initialize(request, server_state))
-           })
-       ).await;
+        let session_handler = Self {
+            internal,
+            session_id: Uuid::new_v4(),
+            app_config, // store global app config revference
+        };
 
-        server.register_notification_handler(
-            "notifications/initialized",
-            Arc::new(move |notification, server_state| {
-                Box::pin(McpServer::handle_initialized_notification(notification, server_state))
-            })
-        ).await;
-
-        // Refister tools/list
-        server.register_request_handler(
-            "tools/list",
-            Arc::new(move |request, server_state| {
-            Box::pin(async move {
-                    McpServer::handle_tools_list(request, server_state).await
-                })
-            })
-        )
-        .await;
-
-        // Register the `tools/call` request handler
-        server.register_request_handler(
-            "tools/call",
-            Arc::new(move |request, server_state| {
+        session_handler.app_config.register_request_handler(
+            "initialize",
+            Arc::new(move |request, session_internal_arg, app_config_arg| { // app_config_arg is now available
                 Box::pin(async move {
-                    McpServer::handle_tools_call(request, server_state).await
+                    McpSessionHandler::handle_initialize(request, session_internal_arg, app_config_arg).await
                 })
             })
         ).await;
 
-        server
+        session_handler.app_config.register_notification_handler(
+            "notifications/initialized",
+            Arc::new(move |notification, session_internal_arg, app_config_arg| {
+                Box::pin(async move {
+                    McpSessionHandler::handle_initialized_notification(notification, session_internal_arg, app_config_arg).await
+                })
+            })
+        ).await;
+
+        session_handler.app_config.register_request_handler(
+            "tools/list",
+            Arc::new(move |request, session_internal_arg, app_config_arg| {
+                Box::pin(async move {
+                    McpSessionHandler::handle_tools_list(request, session_internal_arg, app_config_arg).await
+                })
+            })
+        ).await;
+
+        session_handler.app_config.register_request_handler(
+            "tools/call",
+            Arc::new(move |request, session_internal_arg, app_config_arg| {
+                Box::pin(async move {
+                    McpSessionHandler::handle_tools_call(request, session_internal_arg, app_config_arg).await
+                })
+            })
+        ).await;
+
+        session_handler 
 
     }
 
-    // Helper constructor for Stdio Transport (for backward compatibility)
-    pub async fn start_stdio_server(
-        server_name: String,
-        server_version: Option<String>,
-        server_capabilities: ServerCapabilities,
-        instructions: Option<String>,
-    ) -> Self {
-        let stdio_transport = StdioTransport::new();
-        Self::new(
-            TransportHandle::Stdio(stdio_transport),
-            server_name,
-            server_version,
-            server_capabilities,
-            instructions,
-        ).await
-    }
+    pub async fn send_request_from_server(&self, method: &str, params: Option<Value>) -> Result<Response, McpError> {
+        let id = {
+            let mut next_id = self.internal.next_outgoing_server_request_id.lock().await;
+            let current_id = *next_id;
+            *next_id += 1;
+            RequestId::Number(current_id)
+        };
 
-    pub async fn start_tcp_server(
-        addr: &str,
-        server_name: String,
-        server_version: Option<String>,
-        server_capabilities: ServerCapabilities,
-        instructions: Option<String>,
-        tool_definitions: Vec<Tool>,
-        tool_execution_handlers: Vec<(String, ToolExecutionHandler)>,
-        custom_request_handlers: Vec<(String, RequestHandler)>,
-        custom_notification_handlers: Vec<(String, NotificationHandler)>,
-    ) -> Result<(), McpError> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| McpError::NetworkError(format!("Failed to bind TCP listener to {}: {}", addr, e).into()))?;
+        let request = Request::new(id.clone(), method,params);
+        let (tx, rx) = oneshot::channel();
 
-        eprintln!("Server: TCP server started on {}", addr);
-
-        loop {
-            let (stream, peer_addr) = listener.accept().await
-            .map_err(|e| McpError::NetworkError(format!("Failed to accept TCP connection: {}", e).into()))?;
-            eprintln!("Server: Accepted TCP connection from {}", peer_addr);
-
-            //Create a new McpServer instance (protocol handler) for *this specific connection*.
-            // Each client connection gets its own isolated protocol state.
-            let connection_server = McpServer::new(
-                TransportHandle::Tcp(TcpTransport::new(stream)),
-                server_name.clone(),
-                server_version.clone(),
-                server_capabilities.clone(),
-                instructions.clone(),
-            ).await;
-
-            // register all handlers
-            for tool_def in tool_definitions.iter() {
-                connection_server.add_tool(tool_def.clone()).await;
-            }
-            for (tool_name, handler) in tool_execution_handlers.iter() {
-                connection_server.register_tool_execution_handler(tool_name, handler.clone()).await;
-            }
-            // Register custom request/notification handlers
-            for (method, handler) in custom_request_handlers.iter() {
-                connection_server.register_request_handler(method, handler.clone()).await;
-            }
-            for (method, handler) in custom_notification_handlers.iter() {
-                connection_server.register_notification_handler(method, handler.clone()).await;
-            }
-
-            // spawn new task to handle this client
-            tokio::spawn(async move {
-                eprintln!("Server: New task spawned for connection from {}", peer_addr);
-                if let Err(e) = connection_server.run().await { // `connection_server.run()` drives the per-client protocol.
-                    eprintln!("Server: Connection handler for {} terminated with error: {:?}", peer_addr, e);
-                }
-                eprintln!("Server: Connection handler for {} finished.", peer_addr);
-            });
-
+        {
+            let mut pending_requests = self.internal.pending_outgoing_server_requests.lock().await;
+            pending_requests.insert(id,tx);
         }
+        self.internal.outgoing_tx.send(McpMessage::Request(request)).await
+        .map_err(|e| McpError::NetworkError(format!("Failed to send server-initiated request: {}", e)))?;
+         
+         rx.await.map_err(McpError::OneshotRecv)?
     }
 
-    pub async fn register_request_handler(&self, method: &str, handler : RequestHandler ) {
-        let mut handlers = self.internal.request_handlers.lock().await;
-        if handlers.insert(method.to_string(), handler).is_some() {
-            panic!("Request handler for method '{}' already registered.", method);
-        }
-    }
-    
-    pub async fn register_notification_handler(&self, method: &str, handler: NotificationHandler) {
-        let mut handlers = self.internal.notification_handlers.lock().await;
-        if handlers.insert(method.to_string(), handler).is_some() {
-            panic!("Notification handler for method '{}' already registered.", method);
-        }
-    }
-
-    pub async fn add_tool(&self, tool: Tool) {
-        let mut tools_guard = self.internal.tools.lock().await;
-        tools_guard.push(tool);
-       eprintln!("Server: Added tool definition '{}'. Current tools: {}",
-                  tools_guard.last().unwrap().name, tools_guard.len());
-    }
-
-    pub async fn register_tool_execution_handler(&self, tool_name: &str, handler: ToolExecutionHandler) {
-        let mut handlers = self.internal.tool_execution_handlers.lock().await;
-        if handlers.insert(tool_name.to_string(), handler).is_some() {
-            panic!("Tool execution handler for '{}' already registered.", tool_name);
-        }
-        eprintln!("Server: Registered execution handler for tool '{}'.", tool_name);
-    }
-    
-     pub async fn run(&self) -> Result<(), McpError> {
-        eprintln!("Server: run loop started."); // ADD THIS
-        loop {
-            let msg_result = {
-                let mut transport_guard = self.internal.transport.lock().await;
-                eprintln!("Server: run loop acquiring transport lock for recv, waiting for message..."); // ADD THIS
-                let res = transport_guard.recv().await;
-                eprintln!("Server: run loop released transport lock for recv. Result: {:?}", res); // ADD THIS (Improved logging for Ok)
-                res
-            };
-
-            match msg_result {
-                Ok(message) => {
-                    eprintln!("Server: run loop received message, handling..."); // ADD THIS
-                    self.handle_message(message).await?;
-                    eprintln!("Server: run loop finished handling message."); // ADD THIS
-                },
-                Err(McpError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionAborted => {
-                    eprintln!("Server: Transport connection aborted (EOF), server exiting gracefully."); // CLARIFIED MESSAGE
-                    break;
-                },
-                Err(e) => {
-                    eprintln!("Server: Error receiving message: {:?}", e);
-                    eprintln!("Server: run loop encountered critical error, breaking."); // ADD THIS
-                    break;
-                }
-            }
-        }
-        eprintln!("Server: run loop finished."); // ADD THIS
+    pub async fn send_notification_from_server(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
+        let notification = Notification::new(method, params);
+        self.internal.outgoing_tx.send(McpMessage::Notification(notification)).await
+            .map_err(|e| McpError::NetworkError(format!("Failed to send server-initiated notification: {}", e)))?;
         Ok(())
     }
 
+    pub async fn process_incoming_messages(&self) -> Result<(),McpError> {
+        eprintln!("Session handler run loop started for session {:#?}", self.session_id);
+        loop{
+            let received_msg =  {
+                let mut incoming_rx_guard = self.internal.incoming_rx.lock().await;
+                eprintln!("Server: Session handler acquiring incoming_rx lock, waiting for message...");
+                let res = incoming_rx_guard.recv().await;
+                eprintln!(
+                    "Server: Session handler released incoming_rx lock. Result: {:?}",
+                    res.as_ref().map(|_| "Ok(McpMessage)").unwrap_or_else(|| "None")
+                );
+                res
+            };
+            match received_msg {
+                Some(message) => {
+                    self.handle_message(message).await?;
+                },
+                None => {
+                    eprintln!("Server: Incoming message channel closed, session handler exiting.");
+                    break;
+                }
+            }
+        }
+        eprintln!("Server: Session handler run loop finished for session {:#?}", self.session_id);
+        Ok(())
+    }
 
+    
     async fn handle_message(&self, message: McpMessage) -> Result<(), McpError> {
         match message {
             McpMessage::Request(request) => {
-                // ... (existing Request handling logic - no changes here) ...
                 let method = request.method.clone();
                 let id = request.id.clone();
-                let handlers = self.internal.request_handlers.lock().await;
+                let request_handlers = self.app_config.custom_request_handlers.lock().await; // Access global handlers
 
-                if let Some(handler) = handlers.get(&method) {
-                    let response_result = handler(request, self.internal.clone()).await;
-                    let response = match response_result {
+                let response_to_send = if let Some(handler) = request_handlers.get(&method) {
+                    let response_result = handler(request, self.internal.clone(), self.app_config.clone()).await; // Pass app_config
+                    match response_result {
                         Ok(res) => res,
                         Err(err) => {
-                                   eprintln!("Server: Handler for '{}' returned an error: {:?}", method, err);
-
-                            // --- NEW: Specific Error Mapping ---
+                            eprintln!("Server: Handler for '{}' returned an error: {:?}", method, err);
                             let (error_code, error_message, error_data) = match err {
                                 McpError::ProtocolError(msg) => {
-                                    // For known protocol violations, use -32600 (Invalid Request)
                                     (-32600, msg, None)
                                 },
-                                // Add more specific mappings for other McpError types if needed
                                 McpError::ParseJson(msg) => {
-                                    // If parsing handler's params failed, could be InvalidParams
-                                    (-32602, msg, None) // -32602 is Invalid Params
+                                    (-32602, msg, None)
                                 },
-                                // Default for any other unexpected internal server error
+                                McpError::ToolNotFound(msg) => {
+                                    (-32601, msg, None)
+                                },
                                 _ => {
                                     (-32000, format!("Internal server error: {}", err), None)
                                 }
                             };
-                            // --- End Specific Error Mapping ---
-
-                            Response::new_error(
-                                Some(id), // ID is present for requests
-                                error_code,
-                                &error_message,
-                                error_data,
-                            )
+                            Response::new_error(Some(id.clone()), error_code, &error_message, error_data)
                         }
-                    };
-                    self.internal.transport.lock().await.send(McpMessage::Response(response)).await?;
+                    }
                 } else {
                     eprintln!("Server: Received unhandled request method: {}", method);
-                    let error_response = Response::new_error(
-                        Some(id), // ID is present for requests
-                        -32601, // JSON-RPC standard "Method not found" error code
+                    Response::new_error(
+                        Some(id.clone()),
+                        -32601,
                         &format!("Method '{}' not found", method),
                         None,
-                    );
-                    self.internal.transport.lock().await.send(McpMessage::Response(error_response)).await?;
+                    )
+                };
+                // Send the response back through the session's outgoing channel
+                self.internal.outgoing_tx.send(McpMessage::Response(response_to_send.clone())).await // Clone response for http_response_map
+                    .map_err(|e| McpError::NetworkError(format!("Failed to send response via outgoing channel: {}", e)))?;
+
+                // If this was a request that came via HTTP POST, signal the HTTP layer to respond
+                // This logic is crucial for HTTP Streamable transport
+                let mut http_response_map = self.internal.http_response_map.lock().await;
+                if let Some(oneshot_tx) = http_response_map.remove(&id) { // Use `id` directly here (RequestId as key)
+                    if let Err(_) = oneshot_tx.send(Ok(response_to_send)) { // Send actual response back to HTTP layer
+                        eprintln!("Server: Oneshot sender for HTTP response ID {:?} was dropped. Response not delivered to HTTP layer.", &id);
+                    }
                 }
             }
             McpMessage::Notification(notification) => {
                 let method = notification.method.clone();
-                let notification_handlers = self.internal.notification_handlers.lock().await;
+                let notification_handlers = self.app_config.custom_notification_handlers.lock().await;
 
                 if let Some(handler) = notification_handlers.get(&method) {
-                    // This is a known notification, execute its handler
-                    if let Err(e) = handler(notification, self.internal.clone()).await {
+                    if let Err(e) = handler(notification, self.internal.clone(), self.app_config.clone()).await {
                         eprintln!("Server: Handler for notification '{}' returned an error: {:?}", method, e);
                     }
                 } else {
-                    // This is an UNHANDLED notification.
-                    // Now, check if a REQUEST handler exists for this method name.
-                    let request_handlers = self.internal.request_handlers.lock().await; // Acquire lock for request_handlers
+                    let request_handlers = self.app_config.custom_request_handlers.lock().await;
 
                     if request_handlers.contains_key(&method) {
-                        // This method is known as a REQUEST, but it was received as a NOTIFICATION (missing ID).
-                        // According to MCP's strict "Request MUST have ID", this is an Invalid Request from a practical standpoint.
                         eprintln!("Server: Received method '{}' as a Notification, but it's configured as a Request handler. Informing client.", method);
-
-                        // Send an "Invalid Request" error response with id: null
                         let error_response = Response::new_error(
-                            None, // id: null, as per JSON-RPC spec for errors when original ID is missing/unidentifiable
-                            -32600, // JSON-RPC standard "Invalid Request" error code
+                            None,
+                            -32600,
                             &format!("Method '{}' expects an ID and a response, but was received as a Notification (missing 'id' field).", method),
                             None,
                         );
-                        self.internal.transport.lock().await.send(McpMessage::Response(error_response)).await?;
+                        self.internal.outgoing_tx.send(McpMessage::Response(error_response)).await
+                            .map_err(|e| McpError::NetworkError(format!("Failed to send error response via outgoing channel: {}", e)))?;
                     } else {
-                        // Method is not known at all, neither as a request nor a notification
                         eprintln!("Server: Received completely unknown notification method: {}", method);
                     }
                 }
             }
             McpMessage::Response(response) => {
-                // ... (existing Response handling logic - no changes here) ...
-                eprintln!("Server: Received unexpected response from client: {:?}", response);
+                let response_id = response.id.clone();
+                if let Some(id_val) = response_id {
+                    let mut pending_requests = self.internal.pending_outgoing_server_requests.lock().await;
+                    if let Some(oneshot_tx) = pending_requests.remove(&id_val) {
+                        if let Err(_) = oneshot_tx.send(Ok(response)) {
+                            eprintln!("Server: Oneshot sender for server-initiated request ID {:?} was dropped. Response not delivered.", id_val);
+                        }
+                    } else {
+                        eprintln!("Server: Received unhandled response for server-initiated request ID {:?}.", id_val);
+                    }
+                } else {
+                    eprintln!("Server: Received server-initiated error response without ID: {:?}", response);
+                }
             }
         }
         Ok(())
     }
 
-    pub async fn handle_initialize(request: Request, server_internal: Arc<McpServerInternal>) -> Result<Response, McpError> {
+    async fn handle_initialize(request: Request, session_internal: Arc<McpSessionInternal>, app_config: Arc<McpServer>) -> Result<Response, McpError> {
         let request_id = request.id.clone();
         let params: InitializeRequestParams = serde_json::from_value(request.params.unwrap_or_default())
-            .map_err(|e| McpError::InvalidMessage(format!("Invalid initialize params: {}", e)))?;
+            .map_err(|e| McpError::ParseJson(format!("Invalid initialize params: {}", e)))?;
 
-        // Protocol Version Negotiation (Server-side)
-        // If server supports client's requested version, respond with that.
-        // Otherwise, respond with server's latest supported version.
-        let server_current_version = server_internal.current_protocol_version.clone();
+        let server_current_version = app_config.current_protocol_version.clone(); // Access from app_config
         let response_protocol_version = if params.protocol_version == server_current_version {
             params.protocol_version
         } else {
             eprintln!("Server: Client requested protocol version '{}', but server supports '{}'. Responding with server's version.",
                       params.protocol_version, server_current_version);
-            // TODO: Implement proper version compatibility check and potentially return UnsupportedProtocolVersion error.
-            // If the client's requested version is too old or unsupported at all,
-            // you would send an error response here instead of a success.
-            // Example error: return Ok(Response::new_unsupported_protocol_error(request_id, params.protocol_version, vec![server_current_version.clone()]));
             server_current_version
         };
 
-        // Store the negotiated version in the server's mutable state
-        *server_internal.negotiated_protocol_version.lock().await = Some(response_protocol_version.clone());
+        *session_internal.negotiated_protocol_version.lock().await = Some(response_protocol_version.clone());
 
+        let server_info = ServerInfo {
+            name: app_config.server_name.clone(),
+            title: None,
+            version: app_config.server_version.clone()
+        };
 
         let initialize_result = InitializeResult {
             protocol_version: response_protocol_version,
-            capabilities: server_internal.server_capabilities.clone(),
-            server_info: Some(server_internal.server_info.clone()),
-            instructions: server_internal.instructions.clone(),
+            capabilities: app_config.server_capabilities.clone(), // Access from app_config
+            server_info: Some(server_info), // Access from app_config
+            instructions: app_config.instructions.clone(), // Access from app_config
         };
 
-        Ok(Response::new_initialize_success(request_id, initialize_result))
+        Ok(Response::new_success(request_id, Some(serde_json::to_value(initialize_result).unwrap())))
     }
 
-     /// Handles the `notifications/initialized` notification from the client.
-    /// This associated function logs the event and updates server state.
-    pub async fn handle_initialized_notification(notification: Notification, server_internal: Arc<McpServerInternal>) -> Result<(), McpError> {
-        // Here you would update the server's internal state to reflect that initialization is complete.
-        // For example, setting a flag that allows subsequent operations.
+    async fn handle_initialized_notification(notification: Notification, session_internal: Arc<McpSessionInternal>, app_config: Arc<McpServer>) -> Result<(), McpError> {
         eprintln!("Server: Received 'notifications/initialized' from client. Client is ready.");
-
-        // Example of updating shared state (if needed for this notification beyond logging)
-        // let mut negotiated_version_guard = server_internal.negotiated_protocol_version.lock().unwrap();
-        // if negotiated_version_guard.is_some() {
-        //    eprintln!("Server: Client confirmed initialization on version: {:?}", negotiated_version_guard.as_ref().unwrap());
-        // }
-     
         Ok(())
     }
 
-    pub async fn handle_tools_list(request: Request, server_internal: Arc<McpServerInternal>) -> Result<Response, McpError> {
-        
-        let negotiated_version_guard = server_internal.negotiated_protocol_version.lock().await;
-        if negotiated_version_guard.is_none() {
-            // Return an error if handshake is not complete
-            return Err(McpError::ProtocolError(
-                "Protocol handshake not complete. Please send 'initialize' request first.".to_string()
-            ));
-        }
-
+    async fn handle_tools_list(request: Request, session_internal: Arc<McpSessionInternal>, app_config: Arc<McpServer>) -> Result<Response, McpError> {
         let request_id = request.id.clone();
         let params: ToolsListRequestParams = serde_json::from_value(request.params.unwrap_or_default())
             .map_err(|e| McpError::ParseJson(format!("Invalid tools/list params: {}", e)))?;
-        
-        let tools_guard = server_internal.tools.lock().await; // Acquire lock to read tools metadata
+
+        let tools_guard = app_config.tool_definitions.lock().await; // Access global tool definitions
         let tools_list_result = ToolsListResult {
-            tools: tools_guard.clone(), // Clone the vector to return it
-            next_cursor: None, // No pagination implemented in this example
+            tools: tools_guard.clone(),
+            next_cursor: None,
         };
 
         eprintln!("Server: Responding to tools/list request with {} tools.", tools_list_result.tools.len());
 
-        Ok(Response::new_success(
-            request_id,
-            Some(serde_json::to_value(tools_list_result).unwrap())
-        ))
+        Ok(Response::new_success(request_id, Some(serde_json::to_value(tools_list_result).unwrap())))
     }
-
-     /// Handles the `tools/call` request from the client.
-    async fn handle_tools_call(request: Request, server_internal: Arc<McpServerInternal>) -> Result<Response, McpError> {
-        
-        let negotiated_version_guard = server_internal.negotiated_protocol_version.lock().await;
-        if negotiated_version_guard.is_none() {
-            // Return an error if handshake is not complete
-            return Err(McpError::ProtocolError(
-                "Protocol handshake not complete. Please send 'initialize' request first.".to_string()
-            ));
-        }
-        
+    
+    async fn handle_tools_call(request: Request, session_internal: Arc<McpSessionInternal>, app_config: Arc<McpServer>) -> Result<Response, McpError> {
         let request_id = request.id.clone();
         let params: ToolsCallRequestParams = serde_json::from_value(request.params.unwrap_or_default())
             .map_err(|e| McpError::ParseJson(format!("Invalid tools/call parameters: {}", e)))?;
 
         let tool_name = params.tool_name;
-        // The ToolExecutionHandler expects just the arguments Value, not the whole ToolsCallRequestParams
-        let tool_arguments = params.tool_parameters.unwrap_or_default(); // Default to empty object if None
+        let tool_arguments = params.tool_parameters.unwrap_or_default();
 
-        let handlers = server_internal.tool_execution_handlers.lock().await;
+        let tool_execution_handlers = app_config.tool_execution_handler_registrations.lock().await; // Access global execution handlers
 
-        if let Some(handler) = handlers.get(&tool_name) {
+        if let Some(handler) = tool_execution_handlers.get(&tool_name) {
             eprintln!("Server: Executing tool '{}' with arguments: {:?}", tool_name, tool_arguments);
-            // Execute the specific tool handler and await its result
-            let tool_output_result = handler(tool_arguments, server_internal.clone()).await;
+            let tool_output_result = handler(tool_arguments, session_internal.clone(), app_config.clone()).await; // Pass app_config
 
-            // ToolExecutionHandler returns Result<Value, McpError>
-            // We need to convert this into the specific ToolsCallResult structure
             let call_result = match tool_output_result {
                 Ok(output_value) => {
                     eprintln!("Server: Tool '{}' raw output: {:?}", tool_name, output_value);
-                    
                     ToolsCallResult {
-                        content: vec![ToolOutputContentBlock::Text { text: output_value.to_string() }], // Wrap in Text content for generic output
+                        content: vec![ToolOutputContentBlock::Text { text: output_value.to_string() }],
                         is_error: false,
                         error_message: None,
-                        structured_content: None, // If tool specifically returns structured JSON
+                        structured_content: None,
                         metadata: None,
                     }
                 },
@@ -499,20 +645,176 @@ impl McpServer {
                 }
             };
 
-            Ok(Response::new_success(
-                request_id,
-                Some(serde_json::to_value(call_result).unwrap()) // Serialize the ToolsCallResult
-            ))
+            Ok(Response::new_success(request_id, Some(serde_json::to_value(call_result).unwrap())))
 
         } else {
             eprintln!("Server: Tool '{}' not found or no execution handler registered.", tool_name);
-            Ok(Response::new_error(
-                Some(request_id),
-                -32601, // Method not found (or Tool not found, similar semantic)
-                &format!("Tool '{}' not found or execution handler not registered.", tool_name),
-                None,
-            ))
+            return Err(McpError::ToolNotFound(
+                format!("Tool '{}' not found or execution handler not registered.", tool_name)
+            ));
+        }
+    }
+}
+
+
+// --- NEW: Main HTTP Server Entry Point (The actual HTTP Listener and Router) ---
+pub struct McpHttpServer;
+
+pub struct HttpGlobalAppState {
+    pub sessions: Mutex<HashMap<Uuid, Arc<McpSessionHandler>>>,
+    pub app_config:  Arc<McpServer>
+}
+
+impl McpHttpServer {
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_listener(
+        addr: &str,
+        // The rest of the parameters are now passed via `app_config`
+        app_config: Arc<McpServer>, // Pass the entire application configuration
+    ) -> Result<(), McpError> {
+        let listener = tokio::net::TcpListener::bind(addr).await
+            .map_err(|e| McpError::NetworkError(format!("Failed to bind HTTP listener to {}: {}", addr, e)))?;
+
+        eprintln!("HTTP Server: Listening on http://{}", addr);
+
+        // Create global HTTP state
+        let http_global_state = Arc::new(HttpGlobalAppState {
+            sessions: Mutex::new(HashMap::new()),
+            app_config, // Store the application config
+        });
+
+        // Build Axum Router
+        let app = Router::new()
+            .route("/mcp", post(McpHttpServer::handle_mcp_post)) // POST for requests/notifications/responses
+            .route("/mcp", get(McpHttpServer::handle_mcp_get_sse)) // GET for SSE
+            .with_state(http_global_state); // Pass the global HTTP state to handlers
+
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+        Ok(()) // Should run indefinitely
+    }
+
+    // Handler for HTTP POST requests to /mcp
+    // This is where incoming HTTP requests are processed into McpMessages
+    pub async fn handle_mcp_post(
+        State(state): State<Arc<HttpGlobalAppState>>, // Get global HTTP state
+        Json(raw_json_value): Json<Value>,
+        // Add headers for Session ID, Protocol Version etc. later via `axum::extract::HeaderMap`
+        // For now, assume fixed session ID or create new per request for initial test
+    ) -> impl IntoResponse {
+        eprintln!("HTTP Server: Received POST request body: {:#?}", raw_json_value);
+
+        // 1. Determine Session or Create New (Simplified for initial implementation)
+        // In a real implementation:
+        // - Check Mcp-Session-Id header from request
+        // - If initialize request AND no session header, create new session.
+        // For now, let's create a NEW session handler per POST request for simplicity of this first HTTP step.
+        // This means it's stateless and won't maintain session state across requests initially.
+        // Session management will be built in later phases for HTTP.
+
+        let session_id_for_this_request = Uuid::new_v4(); // Generate a temp ID for this single request's session
+
+        // Create channels for this specific single-request session
+        let (incoming_tx, incoming_rx) = mpsc::channel(1); // Small buffer for request/response
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1); // Small buffer for request/response
+
+        // Create a new McpSessionHandler instance for *this single HTTP POST transaction*.
+        // This session handler's state will be short-lived.
+        let session_handler = McpSessionHandler::new(
+            state.app_config.server_name.clone(),
+            state.app_config.title.clone(),
+            state.app_config.server_version.clone(),
+            state.app_config.server_capabilities.clone(),
+            state.app_config.instructions.clone(),
+            incoming_rx,
+            outgoing_tx,
+            state.app_config.clone(), // Pass Arc<McpServer> (global app config)
+        ).await;
+
+        // Spawn a task to process this single message by the session handler
+        let session_logic_task = task::spawn(async move {
+            eprintln!("HTTP Server: POST request ({:?}/<unknown-peer>): Session logic task spawned for single message.", session_id_for_this_request);
+            session_handler.process_incoming_messages().await // This will run `handle_message`
+        });
+
+        // 2. Push the incoming message (from HTTP POST body) into the session handler's channel
+        let mcp_message = match McpMessage::from_json(&raw_json_value.to_string()) {
+            Ok(msg) => msg,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid MCP message: {e}")
+                ).into_response();
+            }
+        };
+        
+        // Extract the ID of the incoming request for response correlation (only if it's a request)
+        let request_id_for_correlation = if let McpMessage::Request(ref req) = mcp_message {
+            req.id.clone()
+        } else {
+            // For notifications or responses, no ID to correlate for HTTP response.
+            // We'll respond 202 Accepted.
+            RequestId::Number(0) // Dummy ID, won't be used for map lookup
+        };
+
+        if let Err(e) = incoming_tx.send(mcp_message).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to send POST message to session handler: {e}")
+            ).into_response();
+        }
+
+        // 3. Wait for a response from the session handler's outgoing channel
+        // This is for JSON-RPC Requests that expect a response.
+        // For Notifications or server-initiated responses, we will handle `outgoing_rx.recv()` differently.
+        let response_from_session_opt = tokio::time::timeout(
+            Duration::from_secs(5), // Short timeout for HTTP request response
+            outgoing_rx.recv()
+        ).await;
+
+        // Await the session logic task to finish processing this message (optional, but good for one-off POSTs)
+        // If it panics or errors, we want to catch it.
+        if let Err(e) = session_logic_task.await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Session logic task for HTTP POST failed: {}", e)}))).into_response();
+        }
+
+
+        // 4. Format the HTTP response based on what the session handler returned
+        match response_from_session_opt {
+            Ok(Some(McpMessage::Response(response))) => {
+                // If it's a JSON-RPC Request, it will result in a Response message.
+                // MCP spec: for JSON-RPC request, server MUST either return SSE or application/json.
+                // For this simple example, we return application/json (200 OK).
+                (StatusCode::OK, Json(serde_json::to_value(response).unwrap())).into_response()
+            },
+            Ok(Some(McpMessage::Notification(_))) | Ok(Some(McpMessage::Request(_))) => {
+                // If the session handler processes a POSTed Notification or Response (client-to-server)
+                // and internally emits a notification or server-initiated request,
+                // the HTTP layer responds with 202 Accepted.
+                // Or if it processes a POSTed Request and internally decides to respond with a Notification/Request (unlikely but possible).
+                eprintln!("HTTP Server: Session handler returned Notification/Request for POST. Responding 202.");
+                StatusCode::ACCEPTED.into_response()
+            },
+            Ok(None) => {
+                // outgoing_rx.recv() returned None -> channel closed before response
+                eprintln!("HTTP Server: Session handler's outgoing channel closed unexpectedly for POST request.");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            },
+            Err(_) => { // Timeout occurred or other recv error from `timeout`
+                eprintln!("HTTP Server: Session handler did not return response within timeout for POST request.");
+                // This is likely for a POSTed Request where session handler timed out internally.
+                // Return 504 Gateway Timeout or 500 Internal Server Error.
+                StatusCode::GATEWAY_TIMEOUT.into_response()
+            }
         }
     }
 
+ 
+    // Handler for HTTP GET requests to /mcp (for SSE)
+    // For now, return Method Not Allowed. This will be expanded for SSE later.
+    pub async fn handle_mcp_get_sse() -> AxumResponse {
+        eprintln!("HTTP Server: Received GET request for SSE (Not yet fully implemented).");
+        StatusCode::METHOD_NOT_ALLOWED.into_response() // Return 405 Method Not Allowed for now
+    }
 }

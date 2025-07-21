@@ -94,6 +94,8 @@ pub enum McpError{
     OneshotSend(String),
     #[error("Oneshot channel receive error: {0}")]
     OneshotRecv(#[from] tokio::sync::oneshot::error::RecvError),
+    #[error("Tool not found: {0}")]
+    ToolNotFound(String)
     
 }
 
