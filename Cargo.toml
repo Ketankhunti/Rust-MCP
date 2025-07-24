@@ -11,31 +11,20 @@ thiserror = "2.0.12"
 anyhow = "1.0"
 futures = "0.3.31"
 bytes = "1.10.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4","fast-rng"] }
 axum = "0.8.4"
+reqwest = { version = "0.12.22", features = ["json"] }
+axum-macros = "0.5.0"
+
 
 [[bin]]
-name = "initialization_server"
-path = "examples/initialization_server.rs"
+name = "simple_http_server" 
+path = "examples/simple_http_server.rs"
 
 [[bin]]
-name = "tools_server"
-path = "examples/tools_server.rs"
-
-[[bin]]
-name = "tcp_server"
-path = "examples/tcp_server.rs"
-
-
+name = "simple_http_client"
+path = "examples/simple_http_client.rs"
 
 [[test]]
-name = "nitialization_test" 
-path = "tests/initialization_test.rs"
-
-[[test]]
-name = "tools_test" # Name of your test suite
-path = "tests/tools_test.rs"
-
-[[test]]
-name = "tcp_server_test"
-path = "tests/tcp_server_test.rs"
+name = "simple_http_test"
+path = "tests/simple_http_test.rs"

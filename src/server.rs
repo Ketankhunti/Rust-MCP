@@ -2,7 +2,7 @@ use std::{collections::HashMap, hash::Hash, net::SocketAddr, sync::Arc, time::Du
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::{get, get_service, post, post_service}, Json, Router};
 use futures::future::BoxFuture;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::{mpsc, oneshot, Mutex}, task};
 use uuid::Uuid;
 use axum::response::Response as AxumResponse;
@@ -100,6 +100,42 @@ impl McpServer {
             custom_notification_handlers: Mutex::new(HashMap::new()),
         };
 
+        server.register_request_handler(
+            "initialize",
+            Arc::new(move |request, session_internal_arg, app_config_arg| { // app_config_arg is now available
+                Box::pin(async move {
+                    McpSessionHandler::handle_initialize(request, session_internal_arg, app_config_arg).await
+                })
+            })
+        ).await;
+
+        server.register_notification_handler(
+            "notifications/initialized",
+            Arc::new(move |notification, session_internal_arg, app_config_arg| {
+                Box::pin(async move {
+                    McpSessionHandler::handle_initialized_notification(notification, session_internal_arg, app_config_arg).await
+                })
+            })
+        ).await;
+
+        server.register_request_handler(
+            "tools/list",
+            Arc::new(move |request, session_internal_arg, app_config_arg| {
+                Box::pin(async move {
+                    McpSessionHandler::handle_tools_list(request, session_internal_arg, app_config_arg).await
+                })
+            })
+        ).await;
+
+        server.register_request_handler(
+            "tools/call",
+            Arc::new(move |request, session_internal_arg, app_config_arg| {
+                Box::pin(async move {
+                    McpSessionHandler::handle_tools_call(request, session_internal_arg, app_config_arg).await
+                })
+            })
+        ).await;
+
         
         server
 
@@ -108,7 +144,7 @@ impl McpServer {
     pub async fn register_request_handler(&self, method: &str, handler: RequestHandler) {
         let mut handlers = self.custom_request_handlers.lock().await;
         if handlers.contains_key(method) {
-            panic!("Request handler for method '{}' already registered.", method);
+            eprintln!("Request handler for method '{}' already registered.", method);
         }
         handlers.insert(method.to_string(), handler);
     }
@@ -116,7 +152,7 @@ impl McpServer {
     pub async fn register_notification_handler(&self, method: &str, handler: NotificationHandler) {
         let mut handlers = self.custom_notification_handlers.lock().await;
         if handlers.contains_key(method) {
-            panic!("Notification handler for method '{}' already registered.", method);
+            eprintln!("Notification handler for method '{}' already registered.", method);
         }
         handlers.insert(method.to_string(), handler);
     }
@@ -131,7 +167,7 @@ impl McpServer {
     pub async fn register_tool_execution_handler(&self, tool_name: &str, handler: ToolExecutionHandler) { // `&mut self`
         let mut handlers = self.tool_execution_handler_registrations.lock().await;
         if handlers.contains_key(tool_name) {
-            panic!("Tool execution handler for '{}' already registered.", tool_name);
+            eprintln!("Tool execution handler for '{}' already registered.", tool_name);
         }
         handlers.insert(tool_name.to_string(), handler);
         eprintln!("Server: Registered execution handler for tool '{}'.", tool_name);
@@ -197,6 +233,7 @@ impl McpServer {
                     incoming_rx,
                     outgoing_tx,
                     app_config, // Pass Arc<McpServer> (global app config)
+                    
                 ).await;
 
                 session_handler.process_incoming_messages().await?
@@ -227,6 +264,7 @@ impl McpServer {
                         incoming_rx,
                         outgoing_tx,
                         self.clone(), // Pass Arc<McpServer> (global app config)
+                       
                     ).await;
 
                     // spawn task to run core MCP protocol logic for this session
@@ -309,14 +347,15 @@ pub struct McpSessionInternal {
 
     pending_outgoing_server_requests: Mutex<HashMap<RequestId,oneshot::Sender<Result<Response,McpError>>>>,
     next_outgoing_server_request_id: Mutex<u64>,
-    pub http_response_map: Mutex<HashMap<RequestId, oneshot::Sender<Result<Response, McpError>>>>,
+    pub http_response_map: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Response, McpError>>>>>,
 
 }
+
 
 pub struct McpSessionHandler{
     pub internal: Arc<McpSessionInternal>,
     pub session_id: Uuid,
-    pub app_config: Arc<McpServer>
+    pub app_config: Arc<McpServer>,
 }
 
 impl McpSessionHandler {
@@ -330,7 +369,7 @@ impl McpSessionHandler {
         instructions: Option<String>,
         incoming_rx: mpsc::Receiver<McpMessage>,
         outgoing_tx: mpsc::Sender<McpMessage>,
-        app_config: Arc<McpServer>
+        app_config: Arc<McpServer>,
     ) -> Self {
 
         let server_info = ServerInfo {
@@ -353,52 +392,17 @@ impl McpSessionHandler {
             outgoing_tx: outgoing_tx,
             pending_outgoing_server_requests: Mutex::new(HashMap::new()),
             next_outgoing_server_request_id: Mutex::new(0),
-            http_response_map: Mutex::new(HashMap::new()),
+            http_response_map: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let session_handler = Self {
             internal,
             session_id: Uuid::new_v4(),
             app_config, // store global app config revference
+        
         };
 
-        session_handler.app_config.register_request_handler(
-            "initialize",
-            Arc::new(move |request, session_internal_arg, app_config_arg| { // app_config_arg is now available
-                Box::pin(async move {
-                    McpSessionHandler::handle_initialize(request, session_internal_arg, app_config_arg).await
-                })
-            })
-        ).await;
-
-        session_handler.app_config.register_notification_handler(
-            "notifications/initialized",
-            Arc::new(move |notification, session_internal_arg, app_config_arg| {
-                Box::pin(async move {
-                    McpSessionHandler::handle_initialized_notification(notification, session_internal_arg, app_config_arg).await
-                })
-            })
-        ).await;
-
-        session_handler.app_config.register_request_handler(
-            "tools/list",
-            Arc::new(move |request, session_internal_arg, app_config_arg| {
-                Box::pin(async move {
-                    McpSessionHandler::handle_tools_list(request, session_internal_arg, app_config_arg).await
-                })
-            })
-        ).await;
-
-        session_handler.app_config.register_request_handler(
-            "tools/call",
-            Arc::new(move |request, session_internal_arg, app_config_arg| {
-                Box::pin(async move {
-                    McpSessionHandler::handle_tools_call(request, session_internal_arg, app_config_arg).await
-                })
-            })
-        ).await;
-
-        session_handler 
+        session_handler
 
     }
 
@@ -656,12 +660,72 @@ impl McpSessionHandler {
     }
 }
 
+pub struct McpSessionClient {
+    // This is the sender for messages *into* the McpSessionHandler's incoming_rx_internal.
+    pub incoming_tx_to_session_handler: mpsc::Sender<McpMessage>,
+    
+    // This map is used to send responses from the McpSessionHandler back to the HTTP POST handler.
+    pub http_response_map: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Response, McpError>>>>>,
 
+    // This is the receiver for messages *from* the McpSessionHandler's outgoing_tx_internal.
+    // Used for future SSE GET streams. This needs to be the OTHER HALF of the outgoing_tx
+    pub outgoing_rx_from_session_handler: Mutex<mpsc::Receiver<McpMessage>>, // NEW: Store outgoing_rx
+
+    pub session_id: Uuid, // Store session ID for context/logging
+}
+
+impl McpSessionClient {
+    pub fn new(
+        incoming_tx: mpsc::Sender<McpMessage>,
+        outgoing_rx: mpsc::Receiver<McpMessage>, // Added this parameter
+        http_response_map: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Response, McpError>>>>>,
+        session_id: Uuid,
+    ) -> Self {
+        McpSessionClient {
+            incoming_tx_to_session_handler: incoming_tx,
+            outgoing_rx_from_session_handler: Mutex::new(outgoing_rx),
+            http_response_map,
+            session_id,
+        }
+    }
+
+    // Sends a Request message to the session handler and waits for its specific response via oneshot.
+    pub async fn send_request_to_session_handler(&self, request: Request, timeout_duration: Duration) -> Result<Response, McpError> {
+        let id_to_correlate = request.id.clone();
+        
+        let (oneshot_tx, oneshot_rx) = oneshot::channel();
+        
+        { // Store the oneshot sender in the http_response_map
+            let mut map_guard = self.http_response_map.lock().await;
+            if let Some(_) = map_guard.insert(id_to_correlate.clone(), oneshot_tx) {
+                eprintln!("McpSessionClient: WARN: Overwriting http_response_map entry for ID {:?}.", id_to_correlate);
+            }
+        }
+
+        self.incoming_tx_to_session_handler.send(McpMessage::Request(request)).await
+            .map_err(|e| McpError::NetworkError(format!("Failed to send request to session handler: {}", e)))?;
+
+        // Wait for response via oneshot (with timeout)
+        tokio::time::timeout(timeout_duration, oneshot_rx).await
+            .map_err(|_| McpError::RequestTimeout)? // Timeout error
+            .map_err(McpError::OneshotRecv)? // oneshot channel error
+    }
+
+    // Sends a Notification message to the session handler.
+    pub async fn send_notification_to_session_handler(&self, notification: Notification) -> Result<(), McpError> {
+        self.incoming_tx_to_session_handler.send(McpMessage::Notification(notification)).await
+            .map_err(|e| McpError::NetworkError(format!("Failed to send notification to session handler: {}", e)))?;
+        Ok(())
+    }
+
+    // TODO: Add send_response_to_session_handler for client-initiated responses (from client->server Response messages)
+    // This is less common, but possible per spec.
+}
 // --- NEW: Main HTTP Server Entry Point (The actual HTTP Listener and Router) ---
 pub struct McpHttpServer;
 
 pub struct HttpGlobalAppState {
-    pub sessions: Mutex<HashMap<Uuid, Arc<McpSessionHandler>>>,
+    pub sessions: Mutex<HashMap<Uuid, Arc<McpSessionClient>>>,
     pub app_config:  Arc<McpServer>
 }
 
@@ -690,124 +754,157 @@ impl McpHttpServer {
             .route("/mcp", get(McpHttpServer::handle_mcp_get_sse)) // GET for SSE
             .with_state(http_global_state); // Pass the global HTTP state to handlers
 
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
         axum::serve(listener, app).await.unwrap();
         Ok(()) // Should run indefinitely
     }
 
     // Handler for HTTP POST requests to /mcp
     // This is where incoming HTTP requests are processed into McpMessages
+
     pub async fn handle_mcp_post(
         State(state): State<Arc<HttpGlobalAppState>>, // Get global HTTP state
-        Json(raw_json_value): Json<Value>,
-        // Add headers for Session ID, Protocol Version etc. later via `axum::extract::HeaderMap`
-        // For now, assume fixed session ID or create new per request for initial test
-    ) -> impl IntoResponse {
+        headers: axum::http::HeaderMap,
+        Json(raw_json_value): Json<Value>
+    ) -> Result<AxumResponse, McpError>  {
+        
         eprintln!("HTTP Server: Received POST request body: {:#?}", raw_json_value);
 
-        // 1. Determine Session or Create New (Simplified for initial implementation)
-        // In a real implementation:
-        // - Check Mcp-Session-Id header from request
-        // - If initialize request AND no session header, create new session.
-        // For now, let's create a NEW session handler per POST request for simplicity of this first HTTP step.
-        // This means it's stateless and won't maintain session state across requests initially.
-        // Session management will be built in later phases for HTTP.
+        let mcp_message = McpMessage::from_json(&raw_json_value.to_string())?;
 
-        let session_id_for_this_request = Uuid::new_v4(); // Generate a temp ID for this single request's session
-
-        // Create channels for this specific single-request session
-        let (incoming_tx, incoming_rx) = mpsc::channel(1); // Small buffer for request/response
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1); // Small buffer for request/response
-
-        // Create a new McpSessionHandler instance for *this single HTTP POST transaction*.
-        // This session handler's state will be short-lived.
-        let session_handler = McpSessionHandler::new(
-            state.app_config.server_name.clone(),
-            state.app_config.title.clone(),
-            state.app_config.server_version.clone(),
-            state.app_config.server_capabilities.clone(),
-            state.app_config.instructions.clone(),
-            incoming_rx,
-            outgoing_tx,
-            state.app_config.clone(), // Pass Arc<McpServer> (global app config)
-        ).await;
-
-        // Spawn a task to process this single message by the session handler
-        let session_logic_task = task::spawn(async move {
-            eprintln!("HTTP Server: POST request ({:?}/<unknown-peer>): Session logic task spawned for single message.", session_id_for_this_request);
-            session_handler.process_incoming_messages().await // This will run `handle_message`
-        });
-
-        // 2. Push the incoming message (from HTTP POST body) into the session handler's channel
-        let mcp_message = match McpMessage::from_json(&raw_json_value.to_string()) {
-            Ok(msg) => msg,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid MCP message: {e}")
-                ).into_response();
-            }
-        };
+        let is_request = matches!(mcp_message, McpMessage::Request(_));
         
-        // Extract the ID of the incoming request for response correlation (only if it's a request)
-        let request_id_for_correlation = if let McpMessage::Request(ref req) = mcp_message {
-            req.id.clone()
+        let session_id_from_header: Option<Uuid> = headers // Renamed for clarity in this function
+            .get("Mcp-Session-Id")
+            .and_then(|h_val| h_val.to_str().ok())
+            .and_then(|s| Uuid::parse_str(s).ok());
+
+        let session_client_arc: Arc<McpSessionClient>; // This will hold the client interface to the session
+        let mut http_response_headers = axum::http::HeaderMap::new();
+
+        let mut sessions_guard = state.sessions.lock().await;
+
+        if let Some(session_id) = session_id_from_header {
+            if let Some(existing_client) = sessions_guard.get(&session_id) {
+                session_client_arc = existing_client.clone();
+                eprintln!("HTTP Server: Reusing existing session ({:#?}) for POST request.", session_id);
+
+                if is_request && matches!(mcp_message, McpMessage::Request(ref req) if req.method == "initialize") {
+                    eprintln!("HTTP Server: WARN: Initialize request received for existing session ({:#?}). Returning 400 Bad Request.", session_id);
+                    return Ok(StatusCode::BAD_REQUEST.into_response());
+                }
+
+            } else {
+                eprintln!("HTTP Server: Session ID '{:#?}' not found for POST request. Returning 404.", session_id);
+                return Ok(StatusCode::NOT_FOUND.into_response());
+            }
         } else {
-            // For notifications or responses, no ID to correlate for HTTP response.
-            // We'll respond 202 Accepted.
-            RequestId::Number(0) // Dummy ID, won't be used for map lookup
-        };
+            if is_request && matches!(mcp_message, McpMessage::Request(ref req) if req.method == "initialize") {
+                eprintln!("HTTP Server: Creating new MCP session for InitializeRequest.");
+                // Create channels that will bridge HTTP input/output to the new session handler
+                let (incoming_tx_to_session_handler, incoming_rx_from_http) = mpsc::channel(100);
+                let (outgoing_tx_from_session_handler, outgoing_rx_from_session_handler_for_sse) = mpsc::channel(100); // For future SSE GET
 
-        if let Err(e) = incoming_tx.send(mcp_message).await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to send POST message to session handler: {e}")
-            ).into_response();
-        }
+                // Create the McpSessionHandler
+                let new_session_handler = McpSessionHandler::new(
+                    state.app_config.server_name.clone(),
+                    state.app_config.title.clone(),
+                    state.app_config.server_version.clone(),
+                    state.app_config.server_capabilities.clone(),
+                    state.app_config.instructions.clone(),
+                    incoming_rx_from_http, // Receiver for messages from HTTP POST
+                    outgoing_tx_from_session_handler, // Sender for responses from session
+                    state.app_config.clone(),
+                ).await;
 
-        // 3. Wait for a response from the session handler's outgoing channel
-        // This is for JSON-RPC Requests that expect a response.
-        // For Notifications or server-initiated responses, we will handle `outgoing_rx.recv()` differently.
-        let response_from_session_opt = tokio::time::timeout(
-            Duration::from_secs(5), // Short timeout for HTTP request response
-            outgoing_rx.recv()
-        ).await;
+                let new_session_id = new_session_handler.session_id;
 
-        // Await the session logic task to finish processing this message (optional, but good for one-off POSTs)
-        // If it panics or errors, we want to catch it.
-        if let Err(e) = session_logic_task.await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Session logic task for HTTP POST failed: {}", e)}))).into_response();
-        }
+                // Create the McpSessionClient for the new session
+                let new_session_client = Arc::new(McpSessionClient::new(
+                    incoming_tx_to_session_handler, // This sender is given to McpSessionClient
+                    outgoing_rx_from_session_handler_for_sse, // This receiver is given to McpSessionClient for SSE
+                    new_session_handler.internal.http_response_map.clone(), // Share the map
+                    new_session_id,
+                ));
 
+                sessions_guard.insert(new_session_id, new_session_client.clone()); // Store the McpSessionClient
 
-        // 4. Format the HTTP response based on what the session handler returned
-        match response_from_session_opt {
-            Ok(Some(McpMessage::Response(response))) => {
-                // If it's a JSON-RPC Request, it will result in a Response message.
-                // MCP spec: for JSON-RPC request, server MUST either return SSE or application/json.
-                // For this simple example, we return application/json (200 OK).
-                (StatusCode::OK, Json(serde_json::to_value(response).unwrap())).into_response()
-            },
-            Ok(Some(McpMessage::Notification(_))) | Ok(Some(McpMessage::Request(_))) => {
-                // If the session handler processes a POSTed Notification or Response (client-to-server)
-                // and internally emits a notification or server-initiated request,
-                // the HTTP layer responds with 202 Accepted.
-                // Or if it processes a POSTed Request and internally decides to respond with a Notification/Request (unlikely but possible).
-                eprintln!("HTTP Server: Session handler returned Notification/Request for POST. Responding 202.");
-                StatusCode::ACCEPTED.into_response()
-            },
-            Ok(None) => {
-                // outgoing_rx.recv() returned None -> channel closed before response
-                eprintln!("HTTP Server: Session handler's outgoing channel closed unexpectedly for POST request.");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            },
-            Err(_) => { // Timeout occurred or other recv error from `timeout`
-                eprintln!("HTTP Server: Session handler did not return response within timeout for POST request.");
-                // This is likely for a POSTed Request where session handler timed out internally.
-                // Return 504 Gateway Timeout or 500 Internal Server Error.
-                StatusCode::GATEWAY_TIMEOUT.into_response()
+                let state_clone = state.clone();
+
+                // Spawn the persistent session logic task
+                task::spawn(async move {
+                    eprintln!("HTTP Server: Session logic task spawned for session ({:#?}).", new_session_id);
+                    if let Err(e) = new_session_handler.process_incoming_messages().await {
+                         eprintln!("HTTP Server: Session logic for session ({:#?}) terminated with error: {:?}", new_session_id, e);
+                    }
+                    eprintln!("HTTP Server: Session logic for session ({:#?}) finished.", new_session_id);
+                    let mut sessions_map = state_clone.sessions.lock().await;
+                    sessions_map.remove(&new_session_id);
+                    eprintln!("HTTP Server: Session ({:#?}) removed from active sessions map.", new_session_id);
+                });
+
+                session_client_arc = new_session_client.clone(); // Use the created client for this request
+                http_response_headers.insert("Mcp-Session-Id", new_session_id.to_string().parse().unwrap());
+
+            } else {
+                eprintln!("HTTP Server: Non-initialize request without Session ID header. Returning 400 Bad Request.");
+                return Ok(StatusCode::BAD_REQUEST.into_response());
             }
         }
+        drop(sessions_guard); // Drop guard early
+
+        let response_from_session_result: Result<Option<McpMessage>, McpError> = match mcp_message {
+            McpMessage::Request(request_obj) => {
+                session_client_arc
+                    .send_request_to_session_handler(request_obj, Duration::from_secs(5))
+                    .await
+                    .map(|response| Some(McpMessage::Response(response)))
+            }
+            McpMessage::Notification(notification_obj) => {
+                session_client_arc
+                    .send_notification_to_session_handler(notification_obj)
+                    .await
+                    .map(|_| None)
+            }
+            McpMessage::Response(client_response_obj) => {
+                session_client_arc
+                    .send_notification_to_session_handler(Notification::new(
+                        "client/response",
+                        Some(serde_json::to_value(client_response_obj).unwrap()),
+                    ))
+                    .await
+                    .map(|_| None)
+            }
+        };
+
+        let final_axum_response = match response_from_session_result {
+            Ok(Some(McpMessage::Response(response))) => {
+                let mut res = Json(serde_json::to_value(response).unwrap()).into_response();
+                res.headers_mut().extend(http_response_headers);
+                res
+            }
+            Ok(None) => {
+                let mut res = if is_request {
+                    eprintln!("No response for request — timeout.");
+                    StatusCode::GATEWAY_TIMEOUT.into_response()
+                } else {
+                    eprintln!("Notification processed. 202 Accepted.");
+                    StatusCode::ACCEPTED.into_response()
+                };
+                res.headers_mut().extend(http_response_headers);
+                res
+            }
+            Err(e) => {
+                eprintln!("Session handler error: {:?}", e);
+                e.into_response() // Because McpError implements IntoResponse
+            }
+            _ => {
+                // Technically unreachable
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
+        Ok(final_axum_response)
+        
+        
     }
 
  

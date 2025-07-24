@@ -5,6 +5,8 @@ pub mod tcp_transport;
 use std::io::Error;
 use std::collections::HashMap;
 
+use axum::{response::IntoResponse, Json};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, json, Value};
 use thiserror::Error;
@@ -95,7 +97,13 @@ pub enum McpError{
     #[error("Oneshot channel receive error: {0}")]
     OneshotRecv(#[from] tokio::sync::oneshot::error::RecvError),
     #[error("Tool not found: {0}")]
-    ToolNotFound(String)
+    ToolNotFound(String),
+    #[error("Server responded with error: Code={code}, Message='{message}' Data={data:?}")]
+    ServerError {
+        code: i32,
+        message: String,
+        data: Option<Value>,
+    },
     
 }
 
@@ -502,14 +510,77 @@ impl From<u64> for RequestId {
 }
 
 
-// impl From<Option<RequestId>> for RequestId {
-//     fn from(id: Option<RequestId>) -> Self {
-//         match id {
-//             Some(id) => id,
-//             None => RequestId::Number(0)
-//         }
-//     }
-// }
+// impl IntoResponse for McpError
+impl IntoResponse for McpError {
+    fn into_response(self) -> axum::response::Response {
+        eprintln!("HTTP Server: Converting McpError to HTTP Response: {:?}", self); // Log the error being converted
+
+        let (status, error_json) = match self {
+            // JSON-RPC standard error codes: https://www.jsonrpc.org/specification#error_object
+            McpError::Serialization(e) => (
+                StatusCode::BAD_REQUEST, // 400 Bad Request
+                json!({"jsonrpc": "2.0", "error": {"code": -32700, "message": format!("Parse Error: Invalid JSON format: {}", e)}}) // -32700 is JSON-RPC Parse Error
+            ),
+            McpError::ParseJson(msg) => (
+                StatusCode::BAD_REQUEST, // 400 Bad Request
+                json!({"jsonrpc": "2.0", "error": {"code": -32602, "message": format!("Invalid Params: {}", msg)}}) // -32602 is JSON-RPC Invalid Params
+            ),
+            McpError::InvalidMessage(msg) => (
+                StatusCode::BAD_REQUEST, // 400 Bad Request
+                json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": format!("Invalid Request: {}", msg)}}) // -32600 is JSON-RPC Invalid Request
+            ),
+            McpError::NetworkError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR, // 500 Internal Server Error (server's network issue)
+                json!({"jsonrpc": "2.0", "error": {"code": -32000, "message": format!("Server Network Error: {}", msg)}})
+            ),
+            McpError::ProtocolError(msg) => (
+                StatusCode::BAD_REQUEST, // 400 Bad Request (client misuse of protocol flow)
+                json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": format!("Invalid Request (Protocol): {}", msg)}})
+            ),
+            McpError::ToolNotFound(msg) => (
+                StatusCode::NOT_FOUND, // 404 Not Found (semantically, method not found)
+                json!({"jsonrpc": "2.0", "error": {"code": -32601, "message": format!("Method Not Found: {}", msg)}}) // -32601 is JSON-RPC Method Not Found
+            ),
+            McpError::RequestTimeout => (
+                StatusCode::GATEWAY_TIMEOUT, // 504 Gateway Timeout (server waited for something, timed out)
+                json!({"jsonrpc": "2.0", "error": {"code": -32000, "message": "Server did not respond within timeout (Gateway Timeout)".to_string()}})
+            ),
+            McpError::ServerError { code, message, data } => (
+                StatusCode::INTERNAL_SERVER_ERROR, // 500 Internal Server Error (server's internal logic error)
+                json!({"jsonrpc": "2.0", "error": {"code": code, "message": message, "data": data}})
+            ),
+            McpError::AuthError(msg) => (
+                StatusCode::UNAUTHORIZED, // 401 Unauthorized or 403 Forbidden
+                json!({"jsonrpc": "2.0", "error": {"code": -32000, "message": format!("Authentication Error: {}", msg)}})
+            ),
+            McpError::UnsupportedProtocolVersion { requested, supported } => (
+                StatusCode::BAD_REQUEST, // 400 Bad Request
+                json!({"jsonrpc": "2.0", "error": {"code": -32602, "message": "Unsupported protocol version".to_string(), "data": json!({"requested": requested, "supported": supported})}})
+            ),
+            McpError::OneshotSend(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR, // 500 Internal Server Error (server internal channel issue)
+                json!({"jsonrpc": "2.0", "error": {"code": -32000, "message": format!("Internal Server Error (Channel Send): {}", msg)}})
+            ),
+            McpError::OneshotRecv(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR, // 500 Internal Server Error (server internal channel issue)
+                json!({"jsonrpc": "2.0", "error": {"code": -32000, "message": format!("Internal Server Error (Channel Receive): {}", e)}})
+            ),
+            McpError::UnexpectedMessageType(msg) => ( // Add this variant for unexpected client messages
+                StatusCode::BAD_REQUEST,
+                json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": format!("Invalid Request: Unexpected message type: {}", msg)}})
+            ),
+            McpError::Io(e) => ( // Add this variant for low-level IO errors
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"jsonrpc": "2.0", "error": {"code": -32000, "message": format!("Internal Server Error (IO): {}", e)}})
+            ),
+        };
+
+        // Return the formatted HTTP response (status code + JSON body)
+        (status, Json(error_json)).into_response()
+    }
+}
+
+
 impl McpMessage {
     pub fn from_json(json_str: &str) -> Result<Self, McpError> {
         eprintln!("McpMessage::from_json: Attempting to parse: '{}'", json_str.trim());
