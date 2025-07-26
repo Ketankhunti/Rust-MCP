@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    "mcp_macros",
+    "."
+]
+
+
 [package]
 name = "rust_mcp_sdk"
 version = "0.1.0"
@@ -17,7 +24,13 @@ reqwest = { version = "0.12.22", features = ["json"] }
 axum-macros = "0.5.0"
 tokio-stream = "0.1.17"
 reqwest-eventsource = "0.6.0"
+mcp_macros = {path = "./mcp_macros"}
+lazy_static = "1.5.0"
+ctor = "0.4.2"
 
+[[bin]]
+name = "main"
+path = "src/main.rs"
 
 [[bin]]
 name = "simple_http_server" 
@@ -43,6 +56,10 @@ path = "examples/http_sse.rs"
 [[bin]]
 name = "http_prompt_server"
 path = "examples/http_prompt_server.rs"
+
+[[bin]]
+name = "http_macro_tool_server"
+path = "examples/http_macro_tool_server.rs"
 
 # [[test]]
 # name = "simple_http_test"

@@ -8,7 +8,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use uuid::Uuid;
 use axum::response::Response as AxumResponse;
 
-use crate::{prompts::Prompt, tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult};
+use crate::{prompts::Prompt, tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult, TOOL_REGISTRY};
 
 pub type RequestHandler = Arc<
     dyn Fn(Request, Arc<McpSessionInternal>, Arc<McpServer>) -> BoxFuture<'static, Result<Response, McpError>>
@@ -340,6 +340,26 @@ impl McpServer {
 
         Ok(())
     }
+
+    pub async fn register_discovered_tools(&self) {
+        let tools: Vec<(Tool, ToolExecutionHandler)> = {
+            // Lock the registry and drain the tools
+            let mut registry = crate::server::TOOL_REGISTRY
+                .lock()
+                .expect("TOOL_REGISTRY mutex poisoned");
+    
+            registry.drain(..).collect()
+        };
+    
+        // Register each tool and its handler asynchronously
+        for (tool, handler) in tools {
+            let name = tool.name.clone();
+            self.add_tool(tool).await;
+            self.register_tool_execution_handler(&name, handler).await;
+        }
+    }
+    
+
 }
 
 pub struct McpSessionInternal {
