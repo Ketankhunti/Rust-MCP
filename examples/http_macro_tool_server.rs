@@ -4,18 +4,16 @@ use std::sync::Arc;
 use mcp_macros::tool;
 use rust_mcp_sdk::ServerCapabilities;
 
-// Define the tool's logic as a simple, native async function.
-// The `#[tool]` macro handles all the boilerplate.
 #[tool(
     title = "Simple Calculator",
     description = "A tool for adding or subtracting two numbers."
 )]
-pub async fn calculator(operation: String, a: f64, b: f64) -> Result<f64, String> {
-    eprintln!("Executing 'calculator' tool with: {} {} {}", operation, a, b);
-    match operation.as_str() {
+pub async fn calculator(operation: Option<String>, a: f64, b: f64) -> Result<f64, String> {
+    eprintln!("Executing 'calculator' tool with: {:#?} {} {}", operation.as_ref(), a, b);
+    match operation.as_ref().unwrap().as_str() {
         "add" => Ok(a + b),
         "subtract" => Ok(a - b),
-        _ => Err(format!("Invahlid operation: '{}'", operation)),
+        _ => Err(format!("Invahlid operation: '{:#?}'", operation)),
     }
 }
 

@@ -15,14 +15,17 @@ use thiserror::Error;
 use lazy_static::lazy_static;
 use std::sync::Mutex;
 
-use crate::server::ToolExecutionHandler;
+use crate::{prompts::Prompt, server::ToolExecutionHandler};
 
 
 // This static variable will collect all tools defined with the `#[tool]` macro.
 lazy_static! {
     pub static ref TOOL_REGISTRY: Mutex<Vec<(Tool, ToolExecutionHandler)>> = Mutex::new(Vec::new());
-
 }
+
+// lazy_static! {
+//     pub static ref PROMPT_REGISTRY: Mutex<Vec<(Prompt, PromptHandler)>> = Mutex::new(Vec::new());
+// }
 
 // protocol version
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq,)]
