@@ -40,6 +40,10 @@ path = "examples/http_server_session_management.rs"
 name = "http_sse"
 path = "examples/http_sse.rs"
 
+[[bin]]
+name = "http_prompt_server"
+path = "examples/http_prompt_server.rs"
+
 # [[test]]
 # name = "simple_http_test"
 # path = "tests/simple_http_test.rs"

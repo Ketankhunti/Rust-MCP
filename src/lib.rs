@@ -2,6 +2,10 @@ pub mod transport;
 pub mod server;
 pub mod client;
 pub mod tcp_transport;
+pub mod prompts;
+
+use prompts::*;
+
 use std::collections::HashMap;
 
 use axum::{response::IntoResponse, Json};

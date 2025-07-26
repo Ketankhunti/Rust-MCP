@@ -8,7 +8,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use uuid::Uuid;
 use axum::response::Response as AxumResponse;
 
-use crate::{tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult};
+use crate::{prompts::Prompt, tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult};
 
 pub type RequestHandler = Arc<
     dyn Fn(Request, Arc<McpSessionInternal>, Arc<McpServer>) -> BoxFuture<'static, Result<Response, McpError>>
@@ -69,6 +69,8 @@ pub struct McpServer {
     pub tool_execution_handler_registrations: Mutex<HashMap<String, ToolExecutionHandler>>, // Stores execution logic for tools
     pub custom_request_handlers: Mutex<HashMap<String, RequestHandler>>, // User-defined request handlers
     pub custom_notification_handlers: Mutex<HashMap<String, NotificationHandler>>, // User-defined notification handlers
+
+    pub prompt_definitions: Mutex<Vec<Prompt>>,
 }
 
 impl McpServer {
@@ -99,6 +101,7 @@ impl McpServer {
             tool_execution_handler_registrations: Mutex::new(HashMap::new()),
             custom_request_handlers: Mutex::new(HashMap::new()),
             custom_notification_handlers: Mutex::new(HashMap::new()),
+            prompt_definitions: Mutex::new(Vec::new()),
         };
 
         server.register_request_handler(
@@ -172,6 +175,13 @@ impl McpServer {
         }
         handlers.insert(tool_name.to_string(), handler);
         eprintln!("Server: Registered execution handler for tool '{}'.", tool_name);
+    }
+
+    pub async fn add_prompt(&self, prompt: Prompt) {
+        let mut prompt_guard = self.prompt_definitions.lock().await;
+        prompt_guard.push(prompt);
+        eprintln!("Server: Added prompt definition '{}'.", prompt_guard.last().unwrap().name);
+
     }
 
     pub async fn start(
