@@ -25,6 +25,20 @@ path = "examples/simple_http_server.rs"
 name = "simple_http_client"
 path = "examples/simple_http_client.rs"
 
+
+[[bin]]
+name = "http_client_session_management" 
+path = "examples/http_client_session_management.rs"
+
+[[bin]]
+name = "http_server_session_management"
+path = "examples/http_server_session_management.rs"
+
 [[test]]
 name = "simple_http_test"
 path = "tests/simple_http_test.rs"
+
+
+[[test]]
+name = "http_test_session_management"
+path = "tests/http_test_session_management.rs"

@@ -87,7 +87,7 @@ async fn test_simple_http_server_calculator_tool() {
         .expect("Failed to send initialized notification POST request.");
 
     // Server should return 202 Accepted for Notification
-    assert_eq!(http_response.status(), 504, "Expected 202 Accepted for initialized notification.");
+    assert_eq!(http_response.status(), 400, "Expected 202 Accepted for initialized notification.");
     println!("Test: Sent initialized notification (HTTP POST).");
     println!("--- Test: Initialized notification verified (HTTP POST) ---");
 

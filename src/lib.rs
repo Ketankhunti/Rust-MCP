@@ -2,13 +2,12 @@ pub mod transport;
 pub mod server;
 pub mod client;
 pub mod tcp_transport;
-use std::io::Error;
 use std::collections::HashMap;
 
 use axum::{response::IntoResponse, Json};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{from_str, json, Value};
+use serde_json::{json, Value};
 use thiserror::Error;
 // protocol version
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq,)]
