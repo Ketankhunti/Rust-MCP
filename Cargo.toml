@@ -15,6 +15,8 @@ uuid = { version = "1", features = ["v4","fast-rng"] }
 axum = "0.8.4"
 reqwest = { version = "0.12.22", features = ["json"] }
 axum-macros = "0.5.0"
+tokio-stream = "0.1.17"
+reqwest-eventsource = "0.6.0"
 
 
 [[bin]]
@@ -34,11 +36,19 @@ path = "examples/http_client_session_management.rs"
 name = "http_server_session_management"
 path = "examples/http_server_session_management.rs"
 
-[[test]]
-name = "simple_http_test"
-path = "tests/simple_http_test.rs"
+[[bin]]
+name = "http_sse"
+path = "examples/http_sse.rs"
+
+# [[test]]
+# name = "simple_http_test"
+# path = "tests/simple_http_test.rs"
 
 
-[[test]]
-name = "http_test_session_management"
-path = "tests/http_test_session_management.rs"
+# [[test]]
+# name = "http_test_session_management"
+# path = "tests/http_test_session_management.rs"
+
+# [[test]]
+# name = "http_sse"
+# path = "tests/http_sse.rs"

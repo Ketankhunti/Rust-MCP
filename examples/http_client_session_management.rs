@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use uuid::Uuid;
 
-const SERVER_URL: &str = "http://127.0.0.1:8080/mcp";
+const SERVER_URL: &str = "http://127.0.0.1:8081/mcp";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

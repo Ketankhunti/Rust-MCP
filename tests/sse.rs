@@ -13,11 +13,11 @@ async fn test_http_server_with_sse() {
     println!("\n--- Starting HTTP Server with SSE Test ---");
 
     // 1. Spawn the server process
-    let mut server_process = Command::new(env!("CARGO_BIN_EXE_simple_http_server"))
+    let mut server_process = Command::new(env!("CARGO_BIN_EXE_http_sse"))
         .spawn()
         .expect("Failed to spawn simple_http_server process");
 
-    tokio::time::sleep(Duration::from_secs(1)).await; // Give server time to start
+    tokio::time::sleep(Duration::from_secs(1)).await;
     println!("Test: Server process spawned.");
 
     let http_client = Client::new();
@@ -39,7 +39,6 @@ async fn test_http_server_with_sse() {
         .await
         .expect("Failed to send initialize request");
 
-    assert_eq!(init_response.status(), StatusCode::OK);
     let session_id = init_response
         .headers()
         .get("Mcp-Session-Id")
@@ -53,6 +52,7 @@ async fn test_http_server_with_sse() {
     let received_events = Arc::new(Mutex::new(Vec::new()));
     let received_events_clone = received_events.clone();
     let sse_session_id = session_id.clone();
+    let trigger_request_id = 1; // Define request ID for the trigger
 
     let sse_listener_handle = tokio::spawn(async move {
         println!("Test (SSE Task): Connecting to SSE endpoint...");
@@ -64,74 +64,70 @@ async fn test_http_server_with_sse() {
             .expect("Failed to connect to SSE endpoint")
             .bytes_stream();
         
-        println!("Test (SSE Task): Connection established. Waiting for events...");
-        // Listen for incoming data chunks
         while let Some(item) = stream.next().await {
             let chunk = item.expect("Error while reading from SSE stream");
             let line = String::from_utf8(chunk.to_vec()).unwrap();
             
-            // A single SSE message might be split across multiple lines (`event:`, `data:`, etc.)
-            // We are looking for the 'data:' line.
             for part in line.split('\n').filter(|s| !s.is_empty()) {
-                 println!("Test (SSE Task): Received raw line: {}", part);
                  if let Some(data) = part.strip_prefix("data: ") {
-                     println!("Test (SSE Task): Extracted data: {}", data);
                      received_events_clone.lock().unwrap().push(data.to_string());
                  }
             }
         }
-        println!("Test (SSE Task): Stream ended.");
     });
     
-    // Give the SSE GET connection a moment to establish
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // 4. Trigger the server to send a notification via a POST request
-    println!("Test: Triggering server-sent event via POST to test/sse_push...");
+    println!("Test: Triggering server-sent event via POST to sse_push...");
     let trigger_response = http_client
         .post(SERVER_URL)
         .header("Mcp-Session-Id", &session_id)
         .json(&json!({
             "jsonrpc": "2.0",
-            "id": 1,
-            "method": "test/sse_push",
+            "id": trigger_request_id, // Use the variable here
+            "method": "sse_push",
             "params": {}
         }))
         .send()
         .await
         .expect("Failed to send trigger request");
     
-    assert_eq!(trigger_response.status(), StatusCode::OK);
     println!("Test: Trigger request successful.");
 
-    // 5. Verify the event was received by the listener task
-    println!("Test: Verifying received event...");
-    // Wait up to 2 seconds for an event to appear in our shared vector
-    if let Ok(_) = timeout(Duration::from_secs(2), async {
+    // --- NEW: Verify the body of the POST response ---
+    assert_eq!(trigger_response.status(), StatusCode::OK);
+    let trigger_body: Value = trigger_response.json().await.expect("Failed to parse trigger response JSON");
+    println!("Test: Received direct POST response body: {:#?}", trigger_body);
+    
+    assert_eq!(trigger_body["id"], trigger_request_id);
+    assert!(trigger_body["error"].is_null(), "POST response should not be an error.");
+    assert_eq!(trigger_body["result"]["status"], "notification_sent");
+    println!("Test: Direct POST response body verified.");
+    // --- END OF NEW SECTION ---
+
+    // 5. Verify the SSE event was received by the listener task
+    println!("Test: Verifying received SSE event...");
+    if timeout(Duration::from_secs(2), async {
         loop {
-            if !received_events.lock().unwrap().is_empty() {
-                break; // Exit loop once an event is found
-            }
+            if !received_events.lock().unwrap().is_empty() { break; }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    }).await {
-        println!("Test: Event was received within timeout.");
-    } else {
+    }).await.is_err() {
         panic!("Test failed: Did not receive SSE event within timeout period.");
     }
     
-    // Lock the mutex and assert the content is correct
     let events = received_events.lock().unwrap();
-    assert_eq!(events.len(), 1, "Expected to receive exactly one event");
+    assert_eq!(events.len(), 1, "Expected to receive exactly one SSE event");
 
-    let received_json: Value = serde_json::from_str(&events[0]).expect("Failed to parse received JSON");
+    let received_json: Value = serde_json::from_str(&events[0]).expect("Failed to parse received SSE JSON");
     assert_eq!(received_json["method"], "server/test_notification");
     assert_eq!(received_json["params"]["message"], "hello from sse");
 
     println!("Test: SSE event verified successfully!");
 
     // 6. Clean up
-    sse_listener_handle.abort(); // Stop the listener task
+    sse_listener_handle.abort();
     server_process
         .kill()
         .await

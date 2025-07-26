@@ -1,6 +1,6 @@
-use rust_mcp_sdk::server::{McpServer, McpSessionInternal};
+use rust_mcp_sdk::server::{McpServer, McpSessionInternal, RequestHandler};
 use rust_mcp_sdk::{
-    InputSchema, McpError, ServerCapabilities, Tool,
+    InputSchema, McpError, Request, Response, ServerCapabilities, Tool,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -46,10 +46,10 @@ async fn execute_calculator_tool(
 async fn main() -> anyhow::Result<()> {
     eprintln!("Starting MCP Simple HTTP Server example...");
 
-    const ADDR: &str = "127.0.0.1:8081";
+    const ADDR: &str = "127.0.0.1:8080";
 
     let server_capabilities = ServerCapabilities {
-        logging: Some(json!({})),
+        logging: None,//Some(json!({})),
         prompts: None,
         resources: None,
         tools: Some(rust_mcp_sdk::ServerToolsCapability {
@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
+    // --- Register Calculator Tool ---
     app_server
         .add_tool(Tool {
             name: "calculator".to_string(),
@@ -101,8 +102,25 @@ async fn main() -> anyhow::Result<()> {
         .register_tool_execution_handler("calculator", handler_for_calculator)
         .await;
 
-    
+    // --- NEW: Register a handler specifically to test SSE ---
+    let sse_test_handler = Arc::new(|request: Request, session_internal: Arc<McpSessionInternal>, _app_config: Arc<McpServer>| {
+        Box::pin(async move {
+            eprintln!("Server: Received test/sse_push request. Pushing notification to client via SSE.");
+            
+            // This sends a notification message into the outgoing channel, which the SSE stream is listening to.
+            session_internal.send_notification_from_server(
+                "server/test_notification",
+                Some(json!({"message": "hello from sse"}))
+            ).await.unwrap();
 
+            // Send a normal HTTP response to the POST request that triggered this.
+            Ok(Response::new_success(request.id, Some(json!({"status": "notification_sent"}))))
+        }) as Pin<Box<(dyn Future<Output = Result<rust_mcp_sdk::Response, McpError>> + Send + 'static)>>
+    }) as RequestHandler;
+    app_server.register_request_handler("sse_push", sse_test_handler).await;
+
+
+    // --- Start Listener ---
     if let Err(e) = rust_mcp_sdk::server::McpHttpServer::start_listener(
         ADDR,
         Arc::new(app_server),

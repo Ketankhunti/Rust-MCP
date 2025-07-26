@@ -1,9 +1,10 @@
-use std::{collections::HashMap, hash::Hash, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, convert::Infallible, hash::Hash, net::SocketAddr, sync::Arc, time::Duration};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::{get, get_service, post, post_service}, Json, Router};
+use axum::{extract::State, http::StatusCode, response::{sse::{Event, KeepAlive}, IntoResponse, Sse}, routing::{get, get_service, post, post_service}, Json, Router};
 use futures::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::{mpsc, oneshot, Mutex}, task};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use uuid::Uuid;
 use axum::response::Response as AxumResponse;
 
@@ -351,6 +352,54 @@ pub struct McpSessionInternal {
 
 }
 
+impl McpSessionInternal {
+    /// Creates and sends a server-initiated request to the client.
+    /// It waits for and returns the client's response.
+    pub async fn send_request_from_server(&self, method: &str, params: Option<Value>) -> Result<Response, McpError> {
+        // Create a unique ID for this new server-initiated request
+        let id = {
+            let mut next_id = self.next_outgoing_server_request_id.lock().await;
+            let current_id = *next_id;
+            *next_id += 1;
+            RequestId::Number(current_id)
+        };
+
+        let request = Request::new(id.clone(), method, params);
+        
+        // Create a one-shot channel to receive the response for this specific request
+        let (tx, rx) = oneshot::channel();
+
+        // Store the sender half so the response handler can find it
+        {
+            let mut pending_requests = self.pending_outgoing_server_requests.lock().await;
+            pending_requests.insert(id, tx);
+        }
+
+        // Send the request into the outgoing message queue
+        self.outgoing_tx
+            .send(McpMessage::Request(request))
+            .await
+            .map_err(|e| McpError::NetworkError(format!("Failed to send server-initiated request: {}", e)))?;
+
+        // Wait for the corresponding response to arrive on the one-shot channel
+        rx.await.map_err(McpError::OneshotRecv)?
+    }
+
+    /// Creates and sends a server-initiated notification to the client.
+    /// This is a "fire-and-forget" message; it does not wait for a response.
+    pub async fn send_notification_from_server(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
+        let notification = Notification::new(method, params);
+
+        // Send the notification into the outgoing message queue
+        self.outgoing_tx
+            .send(McpMessage::Notification(notification))
+            .await
+            .map_err(|e| McpError::NetworkError(format!("Failed to send server-initiated notification: {}", e)))?;
+            
+        Ok(())
+    }
+}
+
 
 pub struct McpSessionHandler{
     pub internal: Arc<McpSessionInternal>,
@@ -501,17 +550,17 @@ impl McpSessionHandler {
                         None,
                     )
                 };
-                // Send the response back through the session's outgoing channel
-                self.internal.outgoing_tx.send(McpMessage::Response(response_to_send.clone())).await // Clone response for http_response_map
-                    .map_err(|e| McpError::NetworkError(format!("Failed to send response via outgoing channel: {}", e)))?;
-
-                // If this was a request that came via HTTP POST, signal the HTTP layer to respond
-                // This logic is crucial for HTTP Streamable transport
                 let mut http_response_map = self.internal.http_response_map.lock().await;
-                if let Some(oneshot_tx) = http_response_map.remove(&id) { // Use `id` directly here (RequestId as key)
-                    if let Err(_) = oneshot_tx.send(Ok(response_to_send)) { // Send actual response back to HTTP layer
-                        eprintln!("Server: Oneshot sender for HTTP response ID {:?} was dropped. Response not delivered to HTTP layer.", &id);
+                if let Some(oneshot_tx) = http_response_map.remove(&id) {
+                    eprintln!("Server: Routing response for {:?} to HTTP oneshot channel.", id);
+                    if let Err(_) = oneshot_tx.send(Ok(response_to_send)) {
+                        eprintln!("Server: Oneshot sender for HTTP response ID {:?} was dropped.", &id);
                     }
+                } else {
+                  
+                    eprintln!("Server: Routing response for {:?} to general outgoing channel.", id);
+                    self.internal.outgoing_tx.send(McpMessage::Response(response_to_send)).await
+                        .map_err(|e| McpError::NetworkError(format!("Failed to send response via outgoing channel: {}", e)))?;
                 }
             }
             McpMessage::Notification(notification) => {
@@ -669,7 +718,7 @@ pub struct McpSessionClient {
 
     // This is the receiver for messages *from* the McpSessionHandler's outgoing_tx_internal.
     // Used for future SSE GET streams. This needs to be the OTHER HALF of the outgoing_tx
-    pub outgoing_rx_from_session_handler: Mutex<mpsc::Receiver<McpMessage>>, // NEW: Store outgoing_rx
+    pub outgoing_rx_from_session_handler: Mutex<Option<mpsc::Receiver<McpMessage>>>, // NEW: Store outgoing_rx
 
     pub session_id: Uuid, // Store session ID for context/logging
 }
@@ -683,7 +732,7 @@ impl McpSessionClient {
     ) -> Self {
         McpSessionClient {
             incoming_tx_to_session_handler: incoming_tx,
-            outgoing_rx_from_session_handler: Mutex::new(outgoing_rx),
+            outgoing_rx_from_session_handler: Mutex::new(Some(outgoing_rx)),
             http_response_map,
             session_id,
         }
@@ -910,8 +959,59 @@ impl McpHttpServer {
  
     // Handler for HTTP GET requests to /mcp (for SSE)
     // For now, return Method Not Allowed. This will be expanded for SSE later.
-    pub async fn handle_mcp_get_sse() -> AxumResponse {
-        eprintln!("HTTP Server: Received GET request for SSE (Not yet fully implemented).");
-        StatusCode::METHOD_NOT_ALLOWED.into_response() // Return 405 Method Not Allowed for now
+    pub async fn handle_mcp_get_sse(
+        State(state): State<Arc<HttpGlobalAppState>>,
+        headers: axum::http::HeaderMap
+    ) -> AxumResponse {
+        
+        eprintln!("HTTP Server: Received GET request for SSE stream.");
+
+        let session_id_str = match headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
+            Some(s) => s,
+            None => return (StatusCode::BAD_REQUEST, "Mcp-Session-Id header is required for SSE stream").into_response(),
+        };
+
+        let session_id = match Uuid::parse_str(session_id_str) {
+            Ok(id) => id,
+            Err(_) => return (StatusCode::BAD_REQUEST, "Invalid Mcp-Session-Id format").into_response(),
+        };
+
+        eprintln!("HTTP Server: SSE request for session ID: {}", session_id);
+
+        let session_client = {
+            let session_guard = state.sessions.lock().await;
+            session_guard.get(&session_id).cloned()
+        };
+
+        let session_client = match session_client {
+            Some(client) => client,
+            None => return (StatusCode::NOT_FOUND, "Session not found").into_response(),
+        };
+
+        let receiver = match session_client.outgoing_rx_from_session_handler.lock().await.take() {
+            Some(rx) => rx,
+            None => return (StatusCode::CONFLICT, "SSE stream already established for this session").into_response(),
+        };
+
+        eprintln!("HTTP Server: SSE receiver taken for session {}. Starting stream.", session_id);
+
+        let stream = ReceiverStream::new(receiver)
+        .map(move |msg: McpMessage| -> Result<Event, Infallible> {
+            match msg.to_json() {
+                Ok(json_str) => {
+                    eprintln!("SSE Stream [{}]: Sending message: {}", session_id, json_str);
+                    Ok(Event::default().data(json_str))
+                }
+                Err(e) => {
+                    eprintln!("SSE Stream [{}]: Failed to serialize McpMessage: {:?}", session_id, e);
+                    Ok(Event::default().event("error").data("serialization error"))
+                }
+            }
+        });
+
+        Sse::new(stream)
+            .keep_alive(KeepAlive::new().text("keep-alive"))
+            .into_response()
+
     }
 }
