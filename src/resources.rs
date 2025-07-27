@@ -50,7 +50,7 @@ pub struct ResourceContents {
 }
 
 /// Represents metadata annotations for resources.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Annotations {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,4 +109,31 @@ pub struct ResourceTemplatesListResult {
     pub resource_templates: Vec<ResourceTemplate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+
+
+// For `resources/subscribe`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourcesSubscribeParams {
+    pub uri: String,
+}
+
+// For `notifications/resources/updated`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourcesUpdatedParams {
+    pub uri: String,
+    // The notification can optionally include any of the metadata fields that have changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
 }

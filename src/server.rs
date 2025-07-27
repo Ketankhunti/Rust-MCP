@@ -93,6 +93,10 @@ pub struct McpServer {
     // A list of metadata for resources that should be returned by `resources/list`.
     pub resources_definitions: Mutex<Vec<Resource>>,
     pub resource_templates: Mutex<Vec<ResourceTemplate>>,
+
+    pub resource_subscriptions: Mutex<HashMap<String,Vec<Uuid>>>,
+    http_global_state: Mutex<Option<Arc<HttpGlobalAppState>>>,
+
 }
 
 impl McpServer {
@@ -128,6 +132,8 @@ impl McpServer {
             resource_handlers: Mutex::new(HashMap::new()),
             resources_definitions: Mutex::new(Vec::new()),
             resource_templates: Mutex::new(Vec::new()),
+            resource_subscriptions: Mutex::new(HashMap::new()),
+            http_global_state: Mutex::new(None),
         };
 
         server.register_request_handler(
@@ -189,6 +195,11 @@ impl McpServer {
         server.register_request_handler(
             "resources/templates/list",
             Arc::new(|req, session, server| Box::pin(McpSessionHandler::handle_resources_templates_list(req, session, server)))
+        ).await;
+
+        server.register_request_handler(
+            "resources/subscribe",
+            Arc::new(|req, session, server| Box::pin(McpSessionHandler::handle_resources_subscribe(req, session, server)))
         ).await;
         
         server
@@ -405,7 +416,7 @@ impl McpServer {
                     // spawn task to handler TCP I/O bridging for this session
                     task::spawn(async move {
                         eprintln!("Server: I/O task spawned for {}", peer_addr);
-                        let mut tcp_transport = Mutex::new(TcpTransport::new(stream));
+                        let tcp_transport = Mutex::new(TcpTransport::new(stream));
 
                         loop {
                             tokio::select! {
@@ -473,27 +484,58 @@ impl McpServer {
             self.register_tool_execution_handler(&name, handler).await;
         }
     }
+
+    pub async fn set_http_global_state(&self, state: Arc<HttpGlobalAppState>) {
+        *self.http_global_state.lock().await = Some(state);
+    }
+
+    pub async fn notify_resource_updated(&self, uri: &str, updated_params: ResourcesUpdatedParams) {
+        let http_state_guard = self.http_global_state.lock().await;
+        if let Some(http_state) = http_state_guard.as_ref() {
+            let subscriptions = self.resource_subscriptions.lock().await;
+            if let Some(session_ids) = subscriptions.get(uri) {
+                eprintln!("Server: Notifying {} sessions about update to resource '{}'", session_ids.len(), uri);
+                
+                let notification = Notification::new(
+                    "notifications/resources/updated",
+                    Some(serde_json::to_value(updated_params).unwrap())
+                );
+
+                let sessions = http_state.session_outgoing_txs.lock().await;
+                for session_id in session_ids {
+                    if let Some(session_tx) = sessions.get(session_id) {
+                        if let Err(e) = session_tx.send(McpMessage::Notification(notification.clone())).await {
+                            eprintln!("  -> Failed to notify session {}: {}", session_id, e);
+                        } else {
+                            eprintln!("  -> Successfully notified session {}", session_id);
+                        }
+                    }
+                }
+            }
+        } else {
+            eprintln!("Server: Cannot notify resource updated because HTTP global state is not set.");
+        }
+    }
     
 
 }
 
 pub struct McpSessionInternal {
    
-    // pub request_handlers: Mutex<HashMap<String, RequestHandler>>,
-    // pub notification_handlers: Mutex<HashMap<String, NotificationHandler>>,
+    
     pub current_protocol_version: String,
     pub negotiated_protocol_version: Mutex<Option<String>>,
     pub server_capabilities: ServerCapabilities,
     pub server_info: ServerInfo,
     pub instructions: Option<String>,
-    // pub tools: Mutex<Vec<Tool>>,
-    // pub tool_execution_handlers: Mutex<HashMap<String, ToolExecutionHandler>>,
+    
     pub incoming_rx: Mutex<mpsc::Receiver<McpMessage>>,
     pub outgoing_tx: mpsc::Sender<McpMessage>,
 
-    pending_outgoing_server_requests: Mutex<HashMap<RequestId,oneshot::Sender<Result<Response,McpError>>>>,
-    next_outgoing_server_request_id: Mutex<u64>,
+    pub pending_outgoing_server_requests: Mutex<HashMap<RequestId,oneshot::Sender<Result<Response,McpError>>>>,
+    pub next_outgoing_server_request_id: Mutex<u64>,
     pub http_response_map: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<Response, McpError>>>>>,
+    pub session_id: Uuid,
 
 }
 
@@ -576,6 +618,8 @@ impl McpSessionHandler {
             server_capabilities.tools = Some(crate::ServerToolsCapability { list_changed: Some(true) });
         }
 
+        let session_id = Uuid::new_v4();
+
         let internal = Arc::new(McpSessionInternal {
             current_protocol_version: Self::LATEST_SUPPORTED_PROTOCOL_VERSION.to_string(),
             negotiated_protocol_version: Mutex::new(None),
@@ -587,11 +631,12 @@ impl McpSessionHandler {
             pending_outgoing_server_requests: Mutex::new(HashMap::new()),
             next_outgoing_server_request_id: Mutex::new(0),
             http_response_map: Arc::new(Mutex::new(HashMap::new())),
+            session_id,
         });
 
         let session_handler = Self {
             internal,
-            session_id: Uuid::new_v4(),
+            session_id,
             app_config, // store global app config revference
         
         };
@@ -1051,6 +1096,42 @@ impl McpSessionHandler {
         Ok(Response::new_success(request_id, Some(serde_json::to_value(result).unwrap())))
     }
 
+    async fn handle_resources_subscribe(
+        request: Request,
+        _session_internal: Arc<McpSessionInternal>, // We will need this to get the session ID later
+        app_config: Arc<McpServer>,
+    ) -> Result<Response, McpError> {
+        let request_id = request.id.clone();
+        let params: ResourcesSubscribeParams = serde_json::from_value(request.params.unwrap_or_default())?;
+
+        let uri_to_subscribe = &params.uri;
+        
+        let session_id = _session_internal.session_id;
+
+        // It's good practice to check if the resource actually exists before allowing a subscription.
+        let handlers = app_config.resource_handlers.lock().await;
+        if !handlers.contains_key(uri_to_subscribe) {
+            return Err(McpError::ServerError {
+                code: -32002, // Resource not found
+                message: "Resource not found".to_string(),
+                data: Some(json!({ "uri": uri_to_subscribe })),
+            });
+        }
+        drop(handlers);
+
+        // Add the session ID to the list of subscribers for this URI.
+        let mut subscriptions = app_config.resource_subscriptions.lock().await;
+        let subscribers = subscriptions.entry(uri_to_subscribe.clone()).or_default();
+        if !subscribers.contains(&session_id) {
+            subscribers.push(session_id);
+        }
+
+        eprintln!("Server: Session {} subscribed to resource '{}'", session_id, uri_to_subscribe);
+
+        // The spec says "Subscription confirmed", implying a simple success response.
+        Ok(Response::new_success(request_id, Some(json!({ "status": "subscribed" }))))
+    }
+
 }
 
 pub struct McpSessionClient {
@@ -1119,6 +1200,7 @@ pub struct McpHttpServer;
 
 pub struct HttpGlobalAppState {
     pub sessions: Mutex<HashMap<Uuid, Arc<McpSessionClient>>>,
+    pub session_outgoing_txs: Mutex<HashMap<Uuid, mpsc::Sender<McpMessage>>>,
     pub app_config:  Arc<McpServer>
 }
 
@@ -1138,8 +1220,11 @@ impl McpHttpServer {
         // Create global HTTP state
         let http_global_state = Arc::new(HttpGlobalAppState {
             sessions: Mutex::new(HashMap::new()),
-            app_config, // Store the application config
+            session_outgoing_txs: Mutex::new(HashMap::new()),
+            app_config: app_config.clone(), // Store the application config
         });
+
+        app_config.set_http_global_state(http_global_state.clone()).await;
 
         // Build Axum Router
         let app = Router::new()
@@ -1205,7 +1290,7 @@ impl McpHttpServer {
                     state.app_config.server_capabilities.clone(),
                     state.app_config.instructions.clone(),
                     incoming_rx_from_http, // Receiver for messages from HTTP POST
-                    outgoing_tx_from_session_handler, // Sender for responses from session
+                    outgoing_tx_from_session_handler.clone(), // Sender for responses from session
                     state.app_config.clone(),
                 ).await;
 
@@ -1220,6 +1305,7 @@ impl McpHttpServer {
                 ));
 
                 sessions_guard.insert(new_session_id, new_session_client.clone()); // Store the McpSessionClient
+                state.session_outgoing_txs.lock().await.insert(new_session_id, outgoing_tx_from_session_handler);
 
                 let state_clone = state.clone();
 

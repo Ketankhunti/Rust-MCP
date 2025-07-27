@@ -63,6 +63,10 @@ path = "examples/http_prompt_server.rs"
 name = "http_macro_tool_server"
 path = "examples/http_macro_tool_server.rs"
 
+[[bin]]
+name = "http_subscribe_server"
+path = "examples/http_subscribe_server.rs"
+
 # [[test]]
 # name = "simple_http_test"
 # path = "tests/simple_http_test.rs"
