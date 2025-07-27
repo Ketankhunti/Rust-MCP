@@ -29,6 +29,7 @@ ctor = "0.4.2"
 schemars = "1.0.4"
 chrono = {version =  "0.4.41" , features = ["serde"]} 
 base64 = "0.22.1"
+fastrand = "2.3.0"
 
 [[bin]]
 name = "main"
@@ -66,6 +67,19 @@ path = "examples/http_macro_tool_server.rs"
 [[bin]]
 name = "http_subscribe_server"
 path = "examples/http_subscribe_server.rs"
+
+[[bin]]
+name = "http_server_load_simulation"
+path = "examples/http_server_load_simulation.rs"
+
+[[bin]]
+name = "http_all_test_load_simulation"
+path = "examples/http_all_test_load_simulation.rs"
+
+[[bin]]
+name = "single_client_load_test"
+path = "examples/single_client_load_test.rs"
+
 
 # [[test]]
 # name = "simple_http_test"

@@ -1315,10 +1315,18 @@ impl McpHttpServer {
                     if let Err(e) = new_session_handler.process_incoming_messages().await {
                          eprintln!("HTTP Server: Session logic for session ({:#?}) terminated with error: {:?}", new_session_id, e);
                     }
-                    eprintln!("HTTP Server: Session logic for session ({:#?}) finished.", new_session_id);
-                    let mut sessions_map = state_clone.sessions.lock().await;
-                    sessions_map.remove(&new_session_id);
-                    eprintln!("HTTP Server: Session ({:#?}) removed from active sessions map.", new_session_id);
+                    eprintln!("Server: Cleaning up resources for disconnected session {}", new_session_id);
+
+                    // 1. Remove the session's channels from the global maps.
+                    state_clone.sessions.lock().await.remove(&new_session_id);
+                    state_clone.session_outgoing_txs.lock().await.remove(&new_session_id);
+
+                    // 2. Remove the session from all resource subscription lists.
+                    let mut subscriptions = state_clone.app_config.resource_subscriptions.lock().await;
+                    for subscribers in subscriptions.values_mut() {
+                        subscribers.retain(|&id| id != new_session_id);
+                    }
+                    eprintln!("Server: Cleanup complete for session {}", new_session_id);
                 });
 
                 session_client_arc = new_session_client.clone(); // Use the created client for this request
