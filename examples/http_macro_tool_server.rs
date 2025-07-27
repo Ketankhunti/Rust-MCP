@@ -19,6 +19,18 @@ pub async fn calculator(operation: Option<String>, a: f64, b: f64) -> Result<f64
     }
 }
 
+#[tool(
+    title = "Simple Multiplier",
+    description = "A tool for multiplying two numbers."
+)]
+pub async fn multiplier(operation: Option<String>, a: f64, b: f64) -> Result<f64, String> {
+    eprintln!("Executing 'calculator' tool with: {:#?} {} {}", operation.as_ref(), a, b);
+    match operation.as_ref().unwrap().as_str() {
+        "multiply" => Ok(a + b),
+        _ => Err(format!("Invahlid operation: '{:#?}'", operation)),
+    }
+}
+
 #[prompt(
     name = "code_review",
     title = "Review Code Snippet",

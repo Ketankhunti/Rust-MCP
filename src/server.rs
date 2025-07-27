@@ -8,10 +8,10 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use uuid::Uuid;
 use axum::response::Response as AxumResponse;
 
-use crate::{resources::*, LISTABLE_RESOURCE_REGISTRY};
+use crate::{pagination::PaginationCursor, resources::*, ToolsListRequestParams, LISTABLE_RESOURCE_REGISTRY};
 // use mcp_sdk_types::{Prompt, PromptsGetRequestParams, PromptsListResult};
 
-use crate::{prompts::*, tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult, PROMPT_REGISTRY, TOOL_REGISTRY};
+use crate::{prompts::*, tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListResult, PROMPT_REGISTRY, TOOL_REGISTRY};
 
 pub type RequestHandler = Arc<
     dyn Fn(Request, Arc<McpSessionInternal>, Arc<McpServer>) -> BoxFuture<'static, Result<Response, McpError>>
@@ -43,6 +43,8 @@ pub type ResourceHandler = Arc<
     + Send 
     + Sync,
 >;
+
+const PAGE_SIZE: usize = 1; 
 
 pub enum ServerTransportConfig{
     Stdio,
@@ -789,14 +791,30 @@ impl McpSessionHandler {
     }
 
     async fn handle_tools_list(request: Request, session_internal: Arc<McpSessionInternal>, app_config: Arc<McpServer>) -> Result<Response, McpError> {
+        
         let request_id = request.id.clone();
-        let params: ToolsListRequestParams = serde_json::from_value(request.params.unwrap_or_default())
-            .map_err(|e| McpError::ParseJson(format!("Invalid tools/list params: {}", e)))?;
+        let params:ToolsListRequestParams = serde_json::from_value(request.params.unwrap_or_default())?;
+                
+        let start_offset = params.cursor
+        .and_then(|c| PaginationCursor::decode(&c).ok())
+        .map_or(0, |cursor| cursor.offset);
 
-        let tools_guard = app_config.tool_definitions.lock().await; // Access global tool definitions
+
+        let tools = app_config.tool_definitions.lock().await;
+        let end_offset = (start_offset + PAGE_SIZE).min(tools.len());
+
+        let page_of_tools = tools[start_offset..end_offset].to_vec();
+        
+
+        let next_cursor = if end_offset < tools.len() {
+            Some(PaginationCursor{offset : end_offset}.encode())
+        }else{
+            None
+        };
+     // Access global tool definitions
         let tools_list_result = ToolsListResult {
-            tools: tools_guard.clone(),
-            next_cursor: None,
+            tools: page_of_tools,
+            next_cursor: next_cursor
         };
 
         eprintln!("Server: Responding to tools/list request with {} tools.", tools_list_result.tools.len());
@@ -857,13 +875,29 @@ impl McpSessionHandler {
         app_config: Arc<McpServer>,
     ) -> Result<Response, McpError> {
         let request_id = request.id.clone();
-        
-        // In a real implementation, you would handle the `cursor` for pagination.
-        // For now, we return the full list.
+
+        let params: PromptsListRequestParams = serde_json::from_value(request.params.unwrap_or_default())?;
+                
+        let start_offset = params.cursor
+        .and_then(|c| PaginationCursor::decode(&c).ok())
+        .map_or(0, |cursor| cursor.offset);
+
+
         let prompts = app_config.prompt_definitions.lock().await;
+        let end_offset = (start_offset + PAGE_SIZE).min(prompts.len());
+
+        let page_of_prompts = prompts[start_offset..end_offset].to_vec();
+        
+
+        let next_cursor = if end_offset < prompts.len() {
+            Some(PaginationCursor{offset : end_offset}.encode())
+        }else{
+            None
+        };
+
         let result = PromptsListResult {
-            prompts: prompts.clone(),
-            next_cursor: None,
+            prompts: page_of_prompts,
+            next_cursor
         };
 
         eprintln!("Server: Responding to prompts/list with {} prompts.", result.prompts.len());
@@ -915,12 +949,29 @@ impl McpSessionHandler {
         app_config: Arc<McpServer>,
     ) -> Result<Response, McpError> {
         let request_id = request.id.clone();
+
+        let params: ResourcesListRequestParams = serde_json::from_value(request.params.unwrap_or_default())?;
+                
+        let start_offset = params.cursor
+        .and_then(|c| PaginationCursor::decode(&c).ok())
+        .map_or(0, |cursor| cursor.offset);
+
+
+        let resources = app_config.resources_definitions.lock().await;
+        let end_offset = (start_offset + PAGE_SIZE).min(resources.len());
+
+        let page_of_resources = resources[start_offset..end_offset].to_vec();
         
-        let listable = app_config.resources_definitions.lock().await;
+
+        let next_cursor = if end_offset < resources.len() {
+            Some(PaginationCursor{offset : end_offset}.encode())
+        }else{
+            None
+        };
         
         let result = ResourcesListResult {
-            resources: listable.clone(),
-            next_cursor: None,
+            resources: page_of_resources,
+            next_cursor,
         };
 
         eprintln!("Server: Responding to resources/list with {} resources.", result.resources.len());
@@ -971,11 +1022,29 @@ impl McpSessionHandler {
         app_config: Arc<McpServer>,
     ) -> Result<Response, McpError> {
         let request_id = request.id.clone();
+
+        let params: ResourceTemplatesListRequestParams = serde_json::from_value(request.params.unwrap_or_default())?;
+                
+        let start_offset = params.cursor
+        .and_then(|c| PaginationCursor::decode(&c).ok())
+        .map_or(0, |cursor| cursor.offset);
+
+
+        let resource_templates = app_config.resource_templates.lock().await;
+        let end_offset = (start_offset + PAGE_SIZE).min(resource_templates.len());
+
+        let page_of_resource_templates = resource_templates[start_offset..end_offset].to_vec();
         
-        let templates = app_config.resource_templates.lock().await;
+
+        let next_cursor = if end_offset < resource_templates.len() {
+            Some(PaginationCursor{offset : end_offset}.encode())
+        }else{
+            None
+        };
         
         let result = ResourceTemplatesListResult {
-            resource_templates: templates.clone(),
+            resource_templates: page_of_resource_templates,
+            next_cursor
         };
 
         eprintln!("Server: Responding to resources/templates/list with {} templates.", result.resource_templates.len());

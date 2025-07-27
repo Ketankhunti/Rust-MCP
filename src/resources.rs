@@ -1,7 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-// --- Core Resource Data Structures ---
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourcesListRequestParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceTemplatesListRequestParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
 
 /// Represents the metadata for a resource, used in `resources/list`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,4 +107,6 @@ pub struct ResourcesReadResult {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceTemplatesListResult {
     pub resource_templates: Vec<ResourceTemplate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }

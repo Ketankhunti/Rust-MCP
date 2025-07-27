@@ -4,6 +4,7 @@ pub mod client;
 pub mod tcp_transport;
 pub mod prompts;
 pub mod resources;
+pub mod pagination;
 
 use std::collections::HashMap;
 
