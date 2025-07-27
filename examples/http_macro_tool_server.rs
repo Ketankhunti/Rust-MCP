@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 // Bring the procedural macro into scope
 use mcp_macros::{tool,prompt};
-use rust_mcp_sdk::{prompts::{PromptMessage, PromptMessageContent}, ServerCapabilities, ServerPromptsCapability};
-use mcp_sdk_types::PromptMessageRole;
+use rust_mcp_sdk::{prompts::{PromptMessage, PromptMessageContent}, PromptMessageRole, ServerCapabilities, ServerPromptsCapability};
+
 
 #[tool(
     title = "Simple Calculator",

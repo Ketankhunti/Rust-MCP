@@ -226,7 +226,7 @@ pub fn prompt(args: TokenStream, input: TokenStream) -> TokenStream {
             let required = !type_is_option(param_ty);
 
             prompt_arguments.push(quote! {
-                ::mcp_sdk_types::PromptArgument {
+                ::rust_mcp_sdk::PromptArgument {
                     name: #name_str.to_string(),
                     description: None,
                     required: Some(#required),
@@ -244,7 +244,7 @@ pub fn prompt(args: TokenStream, input: TokenStream) -> TokenStream {
 
         #[ctor::ctor]
         fn #registration_fn_name() {
-            let prompt = ::mcp_sdk_types::Prompt {
+            let prompt = ::rust_mcp_sdk::Prompt {
                 name: #name.to_string(),
                 title: Some(#title.to_string()),
                 description: Some(#description.to_string()),

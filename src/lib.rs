@@ -3,6 +3,7 @@ pub mod server;
 pub mod client;
 pub mod tcp_transport;
 pub mod prompts;
+pub mod resources;
 
 use std::collections::HashMap;
 
@@ -14,7 +15,9 @@ use thiserror::Error;
 use lazy_static::lazy_static;
 use std::sync::Mutex;
 use crate::{server::{PromptHandler, ToolExecutionHandler}};
-use mcp_sdk_types::*;
+// use mcp_sdk_types::*;
+pub use resources::*;
+pub use prompts::*;
 
 // This static variable will collect all tools defined with the `#[tool]` macro.
 lazy_static! {
