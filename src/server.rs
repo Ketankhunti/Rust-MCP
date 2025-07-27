@@ -7,8 +7,9 @@ use tokio::{net::TcpListener, sync::{mpsc, oneshot, Mutex}, task};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use uuid::Uuid;
 use axum::response::Response as AxumResponse;
+use mcp_sdk_types::{Prompt, PromptsGetRequestParams, PromptsListResult};
 
-use crate::{prompts::Prompt, tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult, TOOL_REGISTRY};
+use crate::{prompts::{PromptMessage,PromptsGetResult}, tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult, PROMPT_REGISTRY, TOOL_REGISTRY};
 
 pub type RequestHandler = Arc<
     dyn Fn(Request, Arc<McpSessionInternal>, Arc<McpServer>) -> BoxFuture<'static, Result<Response, McpError>>
@@ -27,6 +28,12 @@ pub type ToolExecutionHandler = Arc<
     + Send
     + Sync
 >; 
+
+pub type PromptHandler = Arc<
+    dyn Fn(serde_json::Value) -> BoxFuture<'static, Result<Vec<PromptMessage>, String>>
+    + Send
+    + Sync,
+>;
 
 pub enum ServerTransportConfig{
     Stdio,
@@ -69,8 +76,8 @@ pub struct McpServer {
     pub tool_execution_handler_registrations: Mutex<HashMap<String, ToolExecutionHandler>>, // Stores execution logic for tools
     pub custom_request_handlers: Mutex<HashMap<String, RequestHandler>>, // User-defined request handlers
     pub custom_notification_handlers: Mutex<HashMap<String, NotificationHandler>>, // User-defined notification handlers
-
     pub prompt_definitions: Mutex<Vec<Prompt>>,
+    pub prompt_handler_registrations: Mutex<HashMap<String, PromptHandler>>,
 }
 
 impl McpServer {
@@ -102,6 +109,7 @@ impl McpServer {
             custom_request_handlers: Mutex::new(HashMap::new()),
             custom_notification_handlers: Mutex::new(HashMap::new()),
             prompt_definitions: Mutex::new(Vec::new()),
+            prompt_handler_registrations: Mutex::new(HashMap::new()),
         };
 
         server.register_request_handler(
@@ -138,6 +146,16 @@ impl McpServer {
                     McpSessionHandler::handle_tools_call(request, session_internal_arg, app_config_arg).await
                 })
             })
+        ).await;
+
+        server.register_request_handler(
+            "prompts/list",
+            Arc::new(|req, session, server| Box::pin(McpSessionHandler::handle_prompts_list(req, session, server)))
+        ).await;
+
+        server.register_request_handler(
+            "prompts/get",
+            Arc::new(|req, session, server| Box::pin(McpSessionHandler::handle_prompts_get(req, session, server)))
         ).await;
 
         
@@ -182,6 +200,21 @@ impl McpServer {
         prompt_guard.push(prompt);
         eprintln!("Server: Added prompt definition '{}'.", prompt_guard.last().unwrap().name);
 
+    }
+
+    pub async fn register_prompt_handler(&self, name: &str, handler: PromptHandler) {
+        let mut handlers = self.prompt_handler_registrations.lock().await;
+        handlers.insert(name.to_string(), handler);
+    }
+
+    /// Discovers and registers all prompts defined with the `#[prompt]` macro.
+    pub async fn register_discovered_prompts(&self) {
+        let mut registry = PROMPT_REGISTRY.lock().unwrap();
+        for (prompt, handler) in registry.drain(..) {
+            let name = prompt.name.clone();
+            self.add_prompt(prompt).await;
+            self.register_prompt_handler(&name, handler).await;
+        }
     }
 
     pub async fn start(
@@ -735,6 +768,64 @@ impl McpSessionHandler {
             return Err(McpError::ToolNotFound(
                 format!("Tool '{}' not found or execution handler not registered.", tool_name)
             ));
+        }
+    }
+
+    async fn handle_prompts_list(
+        request: Request,
+        _session_internal: Arc<McpSessionInternal>,
+        app_config: Arc<McpServer>,
+    ) -> Result<Response, McpError> {
+        let request_id = request.id.clone();
+        
+        // In a real implementation, you would handle the `cursor` for pagination.
+        // For now, we return the full list.
+        let prompts = app_config.prompt_definitions.lock().await;
+        let result = PromptsListResult {
+            prompts: prompts.clone(),
+            next_cursor: None,
+        };
+
+        eprintln!("Server: Responding to prompts/list with {} prompts.", result.prompts.len());
+        Ok(Response::new_success(request_id, Some(serde_json::to_value(result).unwrap())))
+    }
+
+    async fn handle_prompts_get(
+        request: Request,
+        _session_internal: Arc<McpSessionInternal>,
+        app_config: Arc<McpServer>,
+    ) -> Result<Response, McpError> {
+        let request_id = request.id.clone();
+        let params: PromptsGetRequestParams = serde_json::from_value(request.params.unwrap_or_default())
+            .map_err(|e| McpError::ParseJson(format!("Invalid prompts/get parameters: {}", e)))?;
+    
+        let prompt_name = params.name;
+        let arguments = params.arguments.unwrap_or_default();
+    
+        let handlers = app_config.prompt_handler_registrations.lock().await;
+    
+        if let Some(handler) = handlers.get(&prompt_name) {
+            eprintln!("Server: Executing prompt '{}' with arguments: {:?}", prompt_name, arguments);
+            
+            // Call the registered handler function.
+            match handler(arguments).await {
+                Ok(messages) => {
+                    // On success, construct the result payload.
+                    let result = PromptsGetResult {
+                        description: Some(format!("Result of prompt: {}", prompt_name)),
+                        messages,
+                    };
+                    Ok(Response::new_success(request_id, Some(serde_json::to_value(result).unwrap())))
+                }
+                Err(e) => {
+                    // If the handler returns an error, wrap it in a protocol error.
+                    eprintln!("Server: Prompt '{}' execution failed: {}", prompt_name, e);
+                    Err(McpError::ProtocolError(format!("Prompt execution failed: {}", e)))
+                }
+            }
+        } else {
+            eprintln!("Server: Prompt '{}' not found.", prompt_name);
+            Err(McpError::ProtocolError(format!("Prompt '{}' not found.", prompt_name)))
         }
     }
 }

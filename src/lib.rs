@@ -4,7 +4,6 @@ pub mod client;
 pub mod tcp_transport;
 pub mod prompts;
 
-
 use std::collections::HashMap;
 
 use axum::{response::IntoResponse, Json};
@@ -14,18 +13,17 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use lazy_static::lazy_static;
 use std::sync::Mutex;
-
-use crate::{prompts::Prompt, server::ToolExecutionHandler};
-
+use crate::{server::{PromptHandler, ToolExecutionHandler}};
+use mcp_sdk_types::*;
 
 // This static variable will collect all tools defined with the `#[tool]` macro.
 lazy_static! {
     pub static ref TOOL_REGISTRY: Mutex<Vec<(Tool, ToolExecutionHandler)>> = Mutex::new(Vec::new());
 }
 
-// lazy_static! {
-//     pub static ref PROMPT_REGISTRY: Mutex<Vec<(Prompt, PromptHandler)>> = Mutex::new(Vec::new());
-// }
+lazy_static! {
+    pub static ref PROMPT_REGISTRY: Mutex<Vec<(Prompt, PromptHandler)>> = Mutex::new(Vec::new());
+}
 
 // protocol version
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq,)]

@@ -1,9 +1,10 @@
 
 use rust_mcp_sdk::{prompts::{
     //...
-    Prompt, PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole,
-    PromptsGetRequestParams, PromptsGetResult, PromptsListResult,
+     PromptMessage, PromptMessageContent, 
+    PromptsGetResult,
 }, ServerCapabilities, ServerPromptsCapability};
+use mcp_sdk_types::*;
 
 use rust_mcp_sdk::server::{McpServer, McpSessionInternal};
 use rust_mcp_sdk::{

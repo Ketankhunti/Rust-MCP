@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 // Bring the procedural macro into scope
-use mcp_macros::tool;
-use rust_mcp_sdk::ServerCapabilities;
+use mcp_macros::{tool,prompt};
+use rust_mcp_sdk::{prompts::{PromptMessage, PromptMessageContent}, ServerCapabilities, ServerPromptsCapability};
+use mcp_sdk_types::PromptMessageRole;
 
 #[tool(
     title = "Simple Calculator",
@@ -17,6 +18,31 @@ pub async fn calculator(operation: Option<String>, a: f64, b: f64) -> Result<f64
     }
 }
 
+#[prompt(
+    name = "code_review",
+    title = "Review Code Snippet",
+    description = "Generates a prompt for an LLM to review a piece of code."
+)]
+pub async fn review_code(code: String) -> Result<Vec<PromptMessage>, String> {
+    eprintln!("Executing 'review_code' prompt for code snippet.");
+
+    // The function's job is to construct the list of messages.
+    let message_text = format!(
+        "Please act as an expert code reviewer. Analyze the following code snippet for quality, \
+        potential bugs, style issues, and suggest improvements. Provide your feedback clearly. \
+        \n\n```\n{}\n```",
+        code
+    );
+
+    let messages = vec![PromptMessage {
+        role: PromptMessageRole::User,
+        content: PromptMessageContent::Text { text: message_text },
+        annotations: None,
+    }];
+
+    Ok(messages)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     eprintln!("Starting MCP Simple HTTP Server example...");
@@ -25,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
     let server_capabilities = ServerCapabilities {
         logging: None,//Some(json!({})),
-        prompts: None,
+        prompts: Some(ServerPromptsCapability{ list_changed : Some(true)}),
         resources: None,
         tools: Some(rust_mcp_sdk::ServerToolsCapability {
             list_changed: Some(true),
@@ -34,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         experimental: None,
     };
 
-    let mut app_server = rust_mcp_sdk::server::McpServer::new(
+    let app_server = rust_mcp_sdk::server::McpServer::new(
         "RustMcpSdkSimpleServer".to_string(),
         Some("MyServer".to_string()),
         Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -45,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Discover and register all tools from the macro ---
     app_server.register_discovered_tools().await;
+    app_server.register_discovered_prompts().await;
 
     // ... (You can add prompts and other handlers here as before) ...
 

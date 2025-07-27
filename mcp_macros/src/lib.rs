@@ -169,3 +169,103 @@ pub fn tool(args: TokenStream, input: TokenStream) -> TokenStream {
 
     TokenStream::from(expanded)
 }
+
+
+#[proc_macro_attribute]
+pub fn prompt(args: TokenStream, input: TokenStream) -> TokenStream {
+    let attr_args = match Punctuated::<Meta, Token![,]>::parse_terminated.parse(args.into()) {
+        Ok(args) => args,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let input_fn = parse_macro_input!(input as ItemFn);
+    let fn_name = &input_fn.sig.ident;
+
+    // --- Extract attributes ---
+    let mut name = String::new();
+    let mut title = String::new();
+    let mut description = String::new();
+
+    for meta in attr_args {
+        if let Meta::NameValue(nv) = meta {
+            let ident = nv.path.get_ident().unwrap().to_string();
+            if let syn::Expr::Lit(expr_lit) = nv.value {
+                if let Lit::Str(lit) = expr_lit.lit {
+                    match ident.as_str() {
+                        "name" => name = lit.value(),
+                        "title" => title = lit.value(),
+                        "description" => description = lit.value(),
+                        _ => panic!("Unknown prompt attribute: {}", ident),
+                    }
+                }
+            }
+        }
+    }
+    if name.is_empty() || title.is_empty() || description.is_empty() {
+        panic!("#[prompt] requires `name`, `title`, and `description` attributes.");
+    }
+
+    // --- Inputs ---
+    let mut param_names = vec![];
+    let mut param_types = vec![];
+    let mut prompt_arguments = vec![];
+
+    for arg in &input_fn.sig.inputs {
+        if let FnArg::Typed(pat_type) = arg {
+            let param_name = if let Pat::Ident(pat_ident) = &*pat_type.pat {
+                pat_ident.ident.clone()
+            } else {
+                panic!("Unsupported parameter pattern in prompt function.");
+            };
+            // FIX: Correctly get the type from the pattern.
+            let param_ty = &pat_type.ty;
+            let name_str = param_name.to_string();
+
+            param_names.push(param_name);
+            param_types.push(param_ty.clone());
+
+            let required = !type_is_option(param_ty);
+
+            prompt_arguments.push(quote! {
+                ::mcp_sdk_types::PromptArgument {
+                    name: #name_str.to_string(),
+                    description: None,
+                    required: Some(#required),
+                }
+            });
+            
+        }
+    }
+
+    // --- Prompt Registration Code ---
+    let registration_fn_name = format_ident!("__register_prompt_{}", fn_name);
+
+    let expanded = quote! {
+        #input_fn
+
+        #[ctor::ctor]
+        fn #registration_fn_name() {
+            let prompt = ::mcp_sdk_types::Prompt {
+                name: #name.to_string(),
+                title: Some(#title.to_string()),
+                description: Some(#description.to_string()),
+                arguments: Some(vec![#(#prompt_arguments),*]),
+            };
+
+            let handler: ::rust_mcp_sdk::server::PromptHandler = std::sync::Arc::new(|params| {
+                Box::pin(async move {
+                    #(
+                        let #param_names: #param_types = serde_json::from_value(
+                            params.get(stringify!(#param_names)).cloned().unwrap_or(serde_json::Value::Null)
+                        ).map_err(|e| format!("Invalid argument '{}': {}", stringify!(#param_names), e))?;
+                    )*
+
+                    #fn_name(#(#param_names),*).await
+                })
+            });
+
+            ::rust_mcp_sdk::PROMPT_REGISTRY.lock().unwrap().push((prompt, handler));
+        }
+    };
+
+    TokenStream::from(expanded)
+}

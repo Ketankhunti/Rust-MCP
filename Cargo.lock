@@ -775,10 +775,19 @@ name = "mcp_macros"
 version = "0.1.0"
 dependencies = [
  "lazy_static",
+ "mcp_sdk_types",
  "proc-macro2",
  "quote",
  "serde_json",
  "syn",
+]
+
+[[package]]
+name = "mcp_sdk_types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1137,6 +1146,7 @@ dependencies = [
  "futures",
  "lazy_static",
  "mcp_macros",
+ "mcp_sdk_types",
  "reqwest",
  "reqwest-eventsource",
  "schemars",

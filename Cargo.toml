@@ -2,7 +2,7 @@
 members = [
     "mcp_macros",
     "."
-]
+, "mcp_sdk_types"]
 
 
 [package]
@@ -25,6 +25,7 @@ axum-macros = "0.5.0"
 tokio-stream = "0.1.17"
 reqwest-eventsource = "0.6.0"
 mcp_macros = {path = "./mcp_macros"}
+mcp_sdk_types = {path = "./mcp_sdk_types"}
 lazy_static = "1.5.0"
 ctor = "0.4.2"
 schemars = "1.0.4"
