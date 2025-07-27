@@ -27,6 +27,7 @@ mcp_macros = {path = "./mcp_macros"}
 lazy_static = "1.5.0"
 ctor = "0.4.2"
 schemars = "1.0.4"
+chrono = {version =  "0.4.41" , features = ["serde"]} 
 
 [[bin]]
 name = "main"

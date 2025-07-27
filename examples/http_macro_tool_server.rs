@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
+use chrono::Utc;
 // Bring the procedural macro into scope
-use mcp_macros::{tool,prompt};
-use rust_mcp_sdk::{prompts::{PromptMessage, PromptMessageContent}, PromptMessageRole, ServerCapabilities, ServerPromptsCapability};
+use mcp_macros::{tool,prompt,resource};
+use rust_mcp_sdk::{prompts::{PromptMessage, PromptMessageContent}, Annotations, PromptMessageRole, Resource, ResourceContents, ServerCapabilities, ServerPromptsCapability, ServerResourcesCapability};
 
 
 #[tool(
@@ -43,6 +44,43 @@ pub async fn review_code(code: String) -> Result<Vec<PromptMessage>, String> {
     Ok(messages)
 }
 
+#[resource(
+    uri = "mcp://status/current",
+    name = "current_status",
+    title = "Current Server Status",
+    description = "Provides the current server time and status.",
+    mime_type = "text/plain"
+)]
+pub async fn get_current_status(uri: String) -> Result<ResourceContents, String> {
+    eprintln!("Executing dynamic resource handler for URI: {}", uri);
+
+    let now = Utc::now();
+    let content_text = format!(
+        "Server Status Report\nTimestamp: {}\nStatus: OK",
+        now.to_rfc3339()
+    );
+
+    let contents = ResourceContents {
+        resource: Resource {
+            uri, // Use the URI passed into the handler
+            name: "current_status".to_string(),
+            title: Some("Current Server Status".to_string()),
+            description: Some("Provides the current server time and status.".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            size: Some(content_text.len() as u64),
+            annotations: Some(Annotations {
+                last_modified: Some(now.to_rfc3339()),
+                audience: None,
+                priority: None
+            }),
+        },
+        text: Some(content_text),
+        blob: None,
+    };
+
+    Ok(contents)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     eprintln!("Starting MCP Simple HTTP Server example...");
@@ -52,7 +90,10 @@ async fn main() -> anyhow::Result<()> {
     let server_capabilities = ServerCapabilities {
         logging: None,//Some(json!({})),
         prompts: Some(ServerPromptsCapability{ list_changed : Some(true)}),
-        resources: None,
+        resources: Some(ServerResourcesCapability {
+            subscribe: Some(false),
+            list_changed: Some(true),
+        }),
         tools: Some(rust_mcp_sdk::ServerToolsCapability {
             list_changed: Some(true),
         }),
@@ -69,11 +110,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    // --- Discover and register all tools from the macro ---
+   
     app_server.register_discovered_tools().await;
     app_server.register_discovered_prompts().await;
-
-    // ... (You can add prompts and other handlers here as before) ...
+    app_server.register_discovered_resources().await;
 
     if let Err(e) = rust_mcp_sdk::server::McpHttpServer::start_listener(ADDR, Arc::new(app_server)).await {
         eprintln!("HTTP Server: Listener terminated with error: {:?}", e);

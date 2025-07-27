@@ -47,6 +47,20 @@ pub struct Annotations {
     pub last_modified: Option<String>, // ISO 8601 timestamp
 }
 
+/// Represents a parameterized resource template.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceTemplate {
+    pub uri_template: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
 
 // --- Protocol Message Payloads ---
 
@@ -72,4 +86,11 @@ pub struct ResourcesReadResult {
     // Note: The spec shows `contents` as an array, which is unusual for a single URI read.
     // We will follow the spec, but in practice, this will likely contain one item.
     pub contents: Vec<ResourceContents>,
+}
+
+// For `resources/templates/list`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceTemplatesListResult {
+    pub resource_templates: Vec<ResourceTemplate>,
 }

@@ -269,3 +269,77 @@ pub fn prompt(args: TokenStream, input: TokenStream) -> TokenStream {
 
     TokenStream::from(expanded)
 }
+
+#[proc_macro_attribute]
+pub fn resource(args: TokenStream, input: TokenStream) -> TokenStream {
+    let attr_args = match Punctuated::<Meta, Token![,]>::parse_terminated.parse(args.into()) {
+        Ok(args) => args,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let input_fn = parse_macro_input!(input as ItemFn);
+    let fn_name = &input_fn.sig.ident;
+
+    // --- Extract attributes ---
+    let mut uri = String::new();
+    let mut name = String::new();
+    let mut title = None;
+    let mut description = None;
+    let mut mime_type = None;
+
+    for meta in attr_args {
+        if let Meta::NameValue(nv) = meta {
+            let ident = nv.path.get_ident().unwrap().to_string();
+            if let syn::Expr::Lit(expr_lit) = nv.value {
+                if let Lit::Str(lit) = expr_lit.lit {
+                    match ident.as_str() {
+                        "uri" => uri = lit.value(),
+                        "name" => name = lit.value(),
+                        "title" => title = Some(lit.value()),
+                        "description" => description = Some(lit.value()),
+                        "mime_type" => mime_type = Some(lit.value()),
+                        _ => panic!("Unknown #[resource] attribute: {}", ident),
+                    }
+                }
+            }
+        }
+    }
+
+    if uri.is_empty() || name.is_empty() {
+        panic!("`#[resource]` requires `uri` and `name` attributes.");
+    }
+
+    let title_expr = title.map(|v| quote! { Some(#v.to_string()) }).unwrap_or(quote! { None });
+    let desc_expr = description.map(|v| quote! { Some(#v.to_string()) }).unwrap_or(quote! { None });
+    let mime_expr = mime_type.map(|v| quote! { Some(#v.to_string()) }).unwrap_or(quote! { None });
+
+    // --- Resource Registration Code ---
+    let registration_fn_name = format_ident!("__register_resource_{}", fn_name);
+
+    let expanded = quote! {
+        #input_fn
+
+        #[ctor::ctor]
+        fn #registration_fn_name() {
+            // 1. Create the metadata for the `resources/list` response.
+            let resource_metadata = ::rust_mcp_sdk::Resource {
+                uri: #uri.to_string(),
+                name: #name.to_string(),
+                title: #title_expr,
+                description: #desc_expr,
+                mime_type: #mime_expr,
+                size: None, // Dynamic resources often don't know their size beforehand
+                annotations: None,
+            };
+            // Add the metadata to the listable registry.
+            ::rust_mcp_sdk::LISTABLE_RESOURCE_REGISTRY.lock().unwrap().push(resource_metadata);
+
+            // 2. Create and register the content handler for the `resources/read` response.
+            let handler: ::rust_mcp_sdk::server::ResourceHandler = std::sync::Arc::new(|uri| {
+                Box::pin(#fn_name(uri))
+            });
+            ::rust_mcp_sdk::RESOURCE_HANDLER_REGISTRY.lock().unwrap().insert(#uri.to_string(), handler);
+        }
+    };
+
+    TokenStream::from(expanded)
+}

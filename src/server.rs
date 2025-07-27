@@ -7,6 +7,8 @@ use tokio::{net::TcpListener, sync::{mpsc, oneshot, Mutex}, task};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use uuid::Uuid;
 use axum::response::Response as AxumResponse;
+
+use crate::{resources::*, LISTABLE_RESOURCE_REGISTRY};
 // use mcp_sdk_types::{Prompt, PromptsGetRequestParams, PromptsListResult};
 
 use crate::{prompts::*, tcp_transport::TcpTransport, transport::StdioTransport, InitializeRequestParams, InitializeResult, McpError, McpMessage, Notification, Request, RequestId, Response, ServerCapabilities, ServerInfo, Tool, ToolOutputContentBlock, ToolsCallRequestParams, ToolsCallResult, ToolsListRequestParams, ToolsListResult, PROMPT_REGISTRY, TOOL_REGISTRY};
@@ -32,6 +34,13 @@ pub type ToolExecutionHandler = Arc<
 pub type PromptHandler = Arc<
     dyn Fn(serde_json::Value) -> BoxFuture<'static, Result<Vec<PromptMessage>, String>>
     + Send
+    + Sync,
+>;
+
+pub type ResourceHandler = Arc<
+    // Takes the URI and maybe some parsed parameters
+    dyn Fn(String) -> BoxFuture<'static, Result<ResourceContents, String>> 
+    + Send 
     + Sync,
 >;
 
@@ -78,6 +87,10 @@ pub struct McpServer {
     pub custom_notification_handlers: Mutex<HashMap<String, NotificationHandler>>, // User-defined notification handlers
     pub prompt_definitions: Mutex<Vec<Prompt>>,
     pub prompt_handler_registrations: Mutex<HashMap<String, PromptHandler>>,
+    pub resource_handlers: Mutex<HashMap<String, ResourceHandler>>,
+    // A list of metadata for resources that should be returned by `resources/list`.
+    pub resources_definitions: Mutex<Vec<Resource>>,
+    pub resource_templates: Mutex<Vec<ResourceTemplate>>,
 }
 
 impl McpServer {
@@ -97,7 +110,7 @@ impl McpServer {
              server_capabilities.tools = Some(crate::ServerToolsCapability { list_changed: Some(true) });
         }
 
-        let mut server = McpServer { // Create the struct
+        let server = McpServer { // Create the struct
             server_name,
             title,
             server_version,
@@ -110,6 +123,9 @@ impl McpServer {
             custom_notification_handlers: Mutex::new(HashMap::new()),
             prompt_definitions: Mutex::new(Vec::new()),
             prompt_handler_registrations: Mutex::new(HashMap::new()),
+            resource_handlers: Mutex::new(HashMap::new()),
+            resources_definitions: Mutex::new(Vec::new()),
+            resource_templates: Mutex::new(Vec::new()),
         };
 
         server.register_request_handler(
@@ -158,6 +174,20 @@ impl McpServer {
             Arc::new(|req, session, server| Box::pin(McpSessionHandler::handle_prompts_get(req, session, server)))
         ).await;
 
+        server.register_request_handler(
+            "resources/list",
+            Arc::new(|req, session, server| Box::pin(McpSessionHandler::handle_resources_list(req, session, server)))
+        ).await;
+
+        server.register_request_handler(
+            "resources/read",
+            Arc::new(|req, session, server| Box::pin(McpSessionHandler::handle_resources_read(req, session, server)))
+        ).await;
+
+        server.register_request_handler(
+            "resources/templates/list",
+            Arc::new(|req, session, server| Box::pin(McpSessionHandler::handle_resources_templates_list(req, session, server)))
+        ).await;
         
         server
 
@@ -214,6 +244,56 @@ impl McpServer {
             let name = prompt.name.clone();
             self.add_prompt(prompt).await;
             self.register_prompt_handler(&name, handler).await;
+        }
+    }
+
+    pub async fn add_resource(&self, resource: ResourceContents) {
+        let uri = resource.resource.uri.clone();
+        
+        // 1. Add the metadata to the list of discoverable resources.
+        let mut listable = self.resources_definitions.lock().await;
+        listable.push(resource.resource.clone());
+        drop(listable);
+
+        // 2. Create a simple handler that just returns the static content.
+        let handler: ResourceHandler = Arc::new(move |_uri: String| {
+            let resource_clone = resource.clone();
+            Box::pin(async move { Ok(resource_clone) })
+        });
+
+        // 3. Add the handler to the unified map.
+        let mut handlers = self.resource_handlers.lock().await;
+        handlers.insert(uri.clone(), handler);
+        eprintln!("Server: Added static resource with URI '{}'.", uri);
+    }
+
+    pub async fn register_resource_handler(&self, uri: &str, handler: ResourceHandler) {
+        let mut handlers = self.resource_handlers.lock().await;
+        handlers.insert(uri.to_string(), handler);
+        eprintln!("Server: Registered dynamic resource handler for URI '{}'.", uri);
+    }
+
+    /// Adds a resource template to the server's collection.
+    pub async fn add_resource_template(&self, template: ResourceTemplate) {
+        let mut templates = self.resource_templates.lock().await;
+        let uri = template.uri_template.clone();
+        templates.push(template);
+        eprintln!("Server: Added resource template with URI '{}'.", uri);
+    }
+
+    pub async fn register_discovered_resources(&self) {
+        // 1. Register the handlers for reading content.
+        let mut handler_registry = crate::RESOURCE_HANDLER_REGISTRY.lock().unwrap();
+        for (uri, handler) in handler_registry.drain() {
+            self.register_resource_handler(&uri, handler).await;
+        }
+        drop(handler_registry); // Release lock
+    
+        // 2. Register the metadata for resources that should be listable.
+        let mut listable_registry = LISTABLE_RESOURCE_REGISTRY.lock().unwrap();
+        let mut server_listable = self.resources_definitions.lock().await;
+        for resource in listable_registry.drain(..) {
+            server_listable.push(resource);
         }
     }
 
@@ -828,6 +908,80 @@ impl McpSessionHandler {
             Err(McpError::ProtocolError(format!("Prompt '{}' not found.", prompt_name)))
         }
     }
+
+    async fn handle_resources_list(
+        request: Request,
+        _session_internal: Arc<McpSessionInternal>,
+        app_config: Arc<McpServer>,
+    ) -> Result<Response, McpError> {
+        let request_id = request.id.clone();
+        
+        let listable = app_config.resources_definitions.lock().await;
+        
+        let result = ResourcesListResult {
+            resources: listable.clone(),
+            next_cursor: None,
+        };
+
+        eprintln!("Server: Responding to resources/list with {} resources.", result.resources.len());
+        Ok(Response::new_success(request_id, Some(serde_json::to_value(result).unwrap())))
+    }
+
+    /// Handles `resources/read` by looking up and executing a handler from the unified map.
+    async fn handle_resources_read(
+        request: Request,
+        _session_internal: Arc<McpSessionInternal>,
+        app_config: Arc<McpServer>,
+    ) -> Result<Response, McpError> {
+        let request_id = request.id.clone();
+        let params: ResourcesReadParams = serde_json::from_value(request.params.unwrap_or_default())?;
+
+        let handlers = app_config.resource_handlers.lock().await;
+        
+        if let Some(handler) = handlers.get(&params.uri) {
+            eprintln!("Server: Found handler for URI '{}'. Executing...", &params.uri);
+            
+            match handler(params.uri.clone()).await {
+                Ok(contents) => {
+                    let result = ResourcesReadResult { contents: vec![contents] };
+                    return Ok(Response::new_success(request_id, Some(serde_json::to_value(result).unwrap())));
+                }
+                Err(e) => {
+                    return Err(McpError::ServerError {
+                        code: -32003, // Custom server error for handler failure
+                        message: "Resource handler failed".to_string(),
+                        data: Some(json!({ "uri": &params.uri, "error": e })),
+                    });
+                }
+            }
+        }
+        
+        // If no handler is found for the URI, return an error.
+        eprintln!("Server: Resource not found for URI '{}'.", &params.uri);
+        Err(McpError::ServerError {
+            code: -32002,
+            message: "Resource not found".to_string(),
+            data: Some(json!({ "uri": params.uri })),
+        })
+    }
+
+    async fn handle_resources_templates_list(
+        request: Request,
+        _session_internal: Arc<McpSessionInternal>,
+        app_config: Arc<McpServer>,
+    ) -> Result<Response, McpError> {
+        let request_id = request.id.clone();
+        
+        let templates = app_config.resource_templates.lock().await;
+        
+        let result = ResourceTemplatesListResult {
+            resource_templates: templates.clone(),
+        };
+
+        eprintln!("Server: Responding to resources/templates/list with {} templates.", result.resource_templates.len());
+        Ok(Response::new_success(request_id, Some(serde_json::to_value(result).unwrap())))
+    }
+
 }
 
 pub struct McpSessionClient {

@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use lazy_static::lazy_static;
 use std::sync::Mutex;
-use crate::{server::{PromptHandler, ToolExecutionHandler}};
+use crate::server::{PromptHandler, ResourceHandler, ToolExecutionHandler};
 // use mcp_sdk_types::*;
 pub use resources::*;
 pub use prompts::*;
@@ -27,6 +27,13 @@ lazy_static! {
 lazy_static! {
     pub static ref PROMPT_REGISTRY: Mutex<Vec<(Prompt, PromptHandler)>> = Mutex::new(Vec::new());
 }
+
+lazy_static! {
+    pub static ref RESOURCE_HANDLER_REGISTRY: Mutex<HashMap<String, ResourceHandler>> = Mutex::new(HashMap::new());
+    pub static ref LISTABLE_RESOURCE_REGISTRY: Mutex<Vec<Resource>> = Mutex::new(Vec::new());
+
+}
+
 
 // protocol version
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq,)]
@@ -345,21 +352,6 @@ pub enum ToolOutputContentBlock {
     Other // Fallback for unknown "type" strings
 }
 
-
-// Assuming a basic Resource struct for `Embedded Resource` type.
-// You might need to expand this when implementing the full Resource feature.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Resource {
-    pub uri: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>, // For text-based embedded resources
-    // ... other fields for a full resource ...
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
