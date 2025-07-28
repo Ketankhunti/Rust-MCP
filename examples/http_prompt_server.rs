@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
     // 3. Register a handler for 'prompts/list'
     let prompts_list_handler = Arc::new(|request: Request, _session, server:Arc<McpServer>| {
         Box::pin(async move {
-            let prompts = server.prompt_definitions.lock().await;
+            let prompts = server.prompt_definitions.read().await;
             let result = PromptsListResult {
                 prompts: prompts.clone(),
                 next_cursor: None,
@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     let prompts_get_handler = Arc::new(|request: Request, _session, server:Arc<McpServer>| {
         Box::pin(async move {
             let params: PromptsGetRequestParams = serde_json::from_value(request.params.clone().unwrap_or_default())?;
-            let prompts = server.prompt_definitions.lock().await;
+            let prompts = server.prompt_definitions.read().await;
 
             // Find the requested prompt
             if let Some(prompt_template) = prompts.iter().find(|p| p.name == params.name) {
