@@ -1230,6 +1230,7 @@ dependencies = [
  "futures",
  "lazy_static",
  "mcp_macros",
+ "once_cell",
  "reqwest",
  "reqwest-eventsource",
  "schemars",

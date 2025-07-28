@@ -1,8 +1,8 @@
-use std::{collections::HashMap, convert::Infallible, hash::Hash, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, convert::Infallible, fmt::format, hash::Hash, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{extract::State, http::StatusCode, response::{sse::{Event, KeepAlive}, IntoResponse, Sse}, routing::{get, get_service, post, post_service}, Json, Router};
 use dashmap::DashMap;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture};
 use serde_json::{json, Value};
 use tokio::{net::TcpListener, sync::{mpsc, oneshot, Mutex, RwLock}, task};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -1270,7 +1270,7 @@ impl McpHttpServer {
 
                 state.sessions.insert(new_session_id, new_session_client.clone()); // Store the McpSessionClient
                 state.session_outgoing_txs.insert(new_session_id, outgoing_tx_from_session_handler);
-
+                
                 let state_clone = state.clone();
 
                 // Spawn the persistent session logic task
@@ -1356,10 +1356,8 @@ impl McpHttpServer {
         
         
     }
-
  
     // Handler for HTTP GET requests to /mcp (for SSE)
-    // For now, return Method Not Allowed. This will be expanded for SSE later.
     pub async fn handle_mcp_get_sse(
         State(state): State<Arc<HttpGlobalAppState>>,
         headers: axum::http::HeaderMap
@@ -1412,6 +1410,5 @@ impl McpHttpServer {
         Sse::new(stream)
             .keep_alive(KeepAlive::new().text("keep-alive"))
             .into_response()
-
     }
 }
