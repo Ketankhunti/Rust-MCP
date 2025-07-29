@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 
 // --- Configuration ---
 const SERVER_URL: &str = "http://127.0.0.1:8080/mcp";
-const NUM_REQUESTS: usize = 500; // The number of simultaneous requests to send
+const NUM_REQUESTS: usize = 1000; // The number of simultaneous requests to send
 
 // --- Shared Statistics ---
 #[derive(Debug, Default)]

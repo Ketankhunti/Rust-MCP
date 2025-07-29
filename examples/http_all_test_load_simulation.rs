@@ -10,7 +10,7 @@ use fastrand;
 
 // --- Configuration ---
 const SERVER_URL: &str = "http://127.0.0.1:8080/mcp";
-const NUM_CLIENTS: usize = 500;
+const NUM_CLIENTS: usize = 450;
 const TEST_DURATION_SECS: u64 = 30;
 
 // --- Shared Statistics ---

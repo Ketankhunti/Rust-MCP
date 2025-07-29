@@ -26,7 +26,7 @@ pub async fn calculator(operation: Option<String>, a: f64, b: f64) -> Result<f64
 pub async fn multiplier(operation: Option<String>, a: f64, b: f64) -> Result<f64, String> {
     eprintln!("Executing 'calculator' tool with: {:#?} {} {}", operation.as_ref(), a, b);
     match operation.as_ref().unwrap().as_str() {
-        "multiply" => Ok(a + b),
+        "multiply" => Ok(a * b),
         _ => Err(format!("Invahlid operation: '{:#?}'", operation)),
     }
 }
@@ -93,7 +93,7 @@ pub async fn get_current_status(uri: String) -> Result<ResourceContents, String>
     Ok(contents)
 }
 
-#[tokio::main(worker_threads = 1)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> anyhow::Result<()> {
     eprintln!("Starting MCP Simple HTTP Server example...");
 

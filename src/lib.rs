@@ -1,6 +1,5 @@
 pub mod transport;
 pub mod server;
-pub mod client;
 pub mod tcp_transport;
 pub mod prompts;
 pub mod resources;
