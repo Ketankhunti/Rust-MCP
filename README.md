@@ -54,7 +54,7 @@ To test the server under heavy concurrent load:
 cargo run --example http_all_test_load_simulation
 ```
 
-This launches 450 async clients, each simulating a full MCP session for 30 seconds. The test showcases the server’s ability to process many requests in parallel.
+This launches 400 async clients, each simulating a full MCP session for 30 seconds. The test showcases the server’s ability to process many requests in parallel.
 
 #### Single Client Load Test
 
