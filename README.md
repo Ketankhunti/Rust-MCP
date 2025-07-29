@@ -4,7 +4,7 @@ A Rust SDK for building high-performance, asynchronous servers and clients that 
 
 ## Asynchronous Architecture
 
-This SDK leverages Rust's async ecosystem (`tokio`, `reqwest`, etc.) to provide non-blocking, highly concurrent server and client implementations. The MCP server can handle hundreds of simultaneous client connections, making it ideal for real-time model serving and interactive applications.
+This SDK leverages Rust's async ecosystem (`tokio`, `reqwest`, etc.) to provide non-blocking, highly concurrent server implementation. The MCP server can handle hundreds of simultaneous client connections, making it ideal for real-time model serving and interactive applications.
 
 - **Async Server:** MCP servers are built using async Rust, allowing efficient handling of requests without blocking threads.
 - **Multi-threaded Execution:** Example servers use multi-threaded async runtimes for maximum throughput.
